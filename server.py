@@ -1210,7 +1210,10 @@ def build_app(include_setup=True):
         body = await request.json()
         ide = body.get("ide", "windsurf")
 
-        venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+        # Windows venvs use Scripts\python.exe; Unix venvs use bin/python.
+        venv_python = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+        if not venv_python.exists():
+            venv_python = REPO_ROOT / ".venv" / "bin" / "python"
         server_path = REPO_ROOT / "server.py"
 
         mcp_entry = {
