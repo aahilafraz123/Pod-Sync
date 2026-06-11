@@ -8,21 +8,38 @@ Two modes:
 
 Both modes share identical tool logic.
 
-Data architecture: all data (entries.json, presence.json, archive/) lives on
-the `logging` branch of each project repo — NOT in the pod-sync repo. The
-pod-sync repo is purely a tool: installer, server, skills.
+Data architecture: all data lives on the `logging` branch of each project
+repo — NOT in the pod-sync repo. The pod-sync repo is purely a tool:
+installer, server, skills.
+
+  <project repo> logging branch:
+    entries/<author>.jsonl            rolling 90-day entry store, one file
+                                      per author so concurrent teammates
+                                      never produce git merge conflicts
+    archive/<author>-YYYY-W##.jsonl   entries older than 90 days
+    openspec/changes/...              OpenSpec proposal documents
+
+Pod-Sync never checks out the logging branch in the user's working tree.
+All reads and writes go through a hidden git worktree under
+~/.local/share/pod-sync/worktrees/, so the user's (and their agent's)
+working state is never stashed, switched, or otherwise disturbed.
+
+Presence is derived from recent commit activity on origin — there is no
+heartbeat file and no background commit traffic.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import threading
-import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from uuid import uuid4
 
 # ---------------------------------------------------------------------------
@@ -33,8 +50,10 @@ REPO_ROOT = pathlib.Path(__file__).parent.resolve()
 WEB_UI_PATH = REPO_ROOT / "web-ui" / "index.html"
 SKILLS_DIR = REPO_ROOT / "skills"
 CONFIG_PATH = pathlib.Path.home() / ".config" / "pod-sync" / "config.json"
+WORKTREES_DIR = pathlib.Path.home() / ".local" / "share" / "pod-sync" / "worktrees"
 PORT = 7823
-HEARTBEAT_INTERVAL = 600  # 10 minutes
+ACTIVE_WINDOW_MINUTES = 30
+PRESENCE_LOOKBACK = "7.days"
 
 # ---------------------------------------------------------------------------
 # Helpers — file I/O
@@ -43,67 +62,60 @@ HEARTBEAT_INTERVAL = 600  # 10 minutes
 def atomic_write(path: pathlib.Path, data):
     """Write JSON atomically — tmp file then os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
 
 
-def load_entries(repo_path: pathlib.Path, include_archive=False, weeks=None):
-    """Load entries from a project repo's logging branch.
-    Assumes we are already on the logging branch."""
-    entries_path = repo_path / "entries.json"
-    archive_dir = repo_path / "archive"
-    entries = json.loads(entries_path.read_text()) if entries_path.exists() else []
-    if include_archive and weeks:
-        for week in weeks:
-            ap = archive_dir / f"{week}.json"
-            if ap.exists():
-                entries += json.loads(ap.read_text())
+def read_jsonl(path: pathlib.Path) -> list:
+    """Read a JSONL file into a list of dicts. Skips malformed lines."""
+    if not path.exists():
+        return []
+    entries = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     return entries
 
 
-def archive_old_entries(repo_path: pathlib.Path):
-    """Move entries older than 90 days into weekly archive files.
-    Operates on a project repo's logging branch. No-op if nothing qualifies."""
-    try:
-        entries_path = repo_path / "entries.json"
-        archive_dir = repo_path / "archive"
-        cutoff = datetime.now() - timedelta(days=90)
-        entries = json.loads(entries_path.read_text()) if entries_path.exists() else []
-
-        to_keep = [e for e in entries if _parse_date(e.get("date", "")) >= cutoff]
-        to_archive = [e for e in entries if _parse_date(e.get("date", "")) < cutoff]
-
-        if not to_archive:
-            return
-
-        by_week = {}
-        for entry in to_archive:
-            week = datetime.strptime(entry["date"], "%Y-%m-%d").strftime("%G-W%V")
-            by_week.setdefault(week, []).append(entry)
-
-        for week, week_entries in by_week.items():
-            archive_path = archive_dir / f"{week}.json"
-            existing = json.loads(archive_path.read_text()) if archive_path.exists() else []
-            atomic_write(archive_path, existing + week_entries)
-
-        atomic_write(entries_path, to_keep)
-    except Exception as e:
-        print(f"[archive] warning: {e}", file=sys.stderr)
+def write_jsonl(path: pathlib.Path, entries: list):
+    """Write a list of dicts as JSONL atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(e) + "\n" for e in entries)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 # ---------------------------------------------------------------------------
 # Helpers — date/time
 # ---------------------------------------------------------------------------
 
 def _parse_date(date_str):
-    """Parse YYYY-MM-DD to datetime. Returns epoch on failure."""
+    """Parse YYYY-MM-DD to datetime. Returns datetime.min on failure."""
     try:
         return datetime.strptime(date_str, "%Y-%m-%d")
     except (ValueError, TypeError):
         return datetime.min
 
 
+def _parse_ts(ts: str) -> Optional[datetime]:
+    """Parse an ISO timestamp to an aware datetime. Naive values are assumed UTC."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def today_iso():
+    # Local date on purpose: a status entry belongs to the author's working day.
     return datetime.now().strftime("%Y-%m-%d")
 
 
@@ -112,7 +124,9 @@ def iso_week():
 
 
 def now_iso():
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    # Timestamps are UTC with an explicit offset so presence/sorting math is
+    # correct across timezones.
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 # ---------------------------------------------------------------------------
 # Helpers — config (registered repos)
@@ -131,19 +145,18 @@ def register_repo(repo_path: str):
     config = load_config()
     if repo_path not in config["registered_repos"]:
         config["registered_repos"].append(repo_path)
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(CONFIG_PATH, config)
 
 # ---------------------------------------------------------------------------
 # Helpers — git
 # ---------------------------------------------------------------------------
 
-def git_config_username():
-    """Read git config user.name. Returns 'Unknown' if not set."""
+def git_config_username(cwd=None):
+    """Read git config user.name from a repo. Returns 'Unknown' if not set."""
     try:
         result = subprocess.run(
             ["git", "config", "user.name"],
-            capture_output=True, text=True, cwd=REPO_ROOT
+            capture_output=True, text=True, cwd=cwd or REPO_ROOT
         )
         name = result.stdout.strip()
         return name if name else "Unknown"
@@ -151,65 +164,69 @@ def git_config_username():
         return "Unknown"
 
 
-def _git_run(args, cwd=None, check=False):
+def author_slug(name: str) -> str:
+    """Filesystem-safe identifier for an author's entry file."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "unknown"
+
+
+def _git_run(args, cwd=None, check=False, input_text=None):
     """Run a git command, return CompletedProcess."""
     return subprocess.run(
         ["git"] + args,
         cwd=cwd or REPO_ROOT,
         capture_output=True, text=True,
-        check=check
+        check=check, input=input_text
     )
 
 
-def _git_pull_branch(branch="main", cwd=None):
+def _git_pull_branch(branch="logging", cwd=None):
     """Pull latest from origin for a specific branch. Returns (success, error_msg)."""
     result = _git_run(["pull", "--rebase", "origin", branch], cwd=cwd)
     if result.returncode != 0:
-        return False, _classify_git_error(result.stderr)
+        return False, _classify_git_error(result.stderr, cwd=cwd)
     return True, ""
 
 
-def _git_push(branch="main", cwd=None):
+def _git_push(branch="logging", cwd=None):
     """Push to origin. Returns (success, error_msg)."""
     result = _git_run(["push", "origin", branch], cwd=cwd)
     if result.returncode != 0:
-        return False, _classify_git_error(result.stderr)
+        return False, _classify_git_error(result.stderr, cwd=cwd)
     return True, ""
 
 
-def _git_commit_and_push(message, paths=None, branch="logging", cwd=None, retries=2):
+def _git_commit_and_push(message, paths=None, branch="logging", cwd=None, retries=3):
     """Stage paths, commit, push. Retries with pull-rebase on push failure."""
-    target_cwd = cwd
-    if paths:
-        for p in paths:
-            _git_run(["add", str(p)], cwd=target_cwd)
-    else:
-        _git_run(["add", "-A"], cwd=target_cwd)
+    for p in (paths or ["-A"]):
+        _git_run(["add", str(p)], cwd=cwd)
 
-    result = _git_run(["commit", "-m", message], cwd=target_cwd)
+    result = _git_run(["commit", "-m", message], cwd=cwd)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "nothing to commit" in stderr or "nothing to commit" in result.stdout:
             return True, ""
         return False, f"Commit failed: {stderr}"
 
-    for attempt in range(retries):
-        ok, err = _git_push(branch, cwd=target_cwd)
+    err = ""
+    for _ in range(retries):
+        ok, err = _git_push(branch, cwd=cwd)
         if ok:
             return True, ""
-        # Push rejected — pull rebase and retry
-        pull_ok, pull_err = _git_pull_branch(branch, cwd=target_cwd)
+        # Push rejected — pull rebase and retry. Per-author entry files mean
+        # the rebase never has to merge another teammate's changes into ours.
+        pull_ok, pull_err = _git_pull_branch(branch, cwd=cwd)
         if not pull_ok:
             return False, f"Push failed and pull-rebase also failed: {pull_err}"
 
     return False, f"Push failed after {retries} attempts: {err}"
 
 
-def _get_git_host():
+def _get_git_host(cwd=None):
     """Parse the git host from the origin remote URL.
     Handles both SSH (git@host:...) and HTTPS (https://host/...) formats."""
     try:
-        url = _git_run(["remote", "get-url", "origin"]).stdout.strip()
+        url = _git_run(["remote", "get-url", "origin"], cwd=cwd).stdout.strip()
         if url.startswith("git@"):
             return url.split("@")[1].split(":")[0]
         elif "://" in url:
@@ -227,17 +244,18 @@ def get_repo_name_from_path(repo_path: pathlib.Path) -> str:
         # Remove trailing .git suffix properly (not rstrip which strips chars)
         if url.endswith(".git"):
             url = url[:-4]
-        return url.split("/")[-1].split(":")[-1]
+        name = url.split("/")[-1].split(":")[-1]
+        return name or repo_path.name
     except Exception:
         return repo_path.name
 
 
-def _classify_git_error(stderr):
+def _classify_git_error(stderr, cwd=None):
     """Inspect stderr for auth/SSO signals and return actionable message."""
-    host = _get_git_host()
     lower = stderr.lower()
     for signal in ["saml", "sso", "authentication", "403", "permission denied"]:
         if signal in lower:
+            host = _get_git_host(cwd=cwd)
             return (
                 f"Git authentication failed. Re-authorize your credentials:\n"
                 f"  SSH: https://{host}/settings/ssh\n"
@@ -246,107 +264,209 @@ def _classify_git_error(stderr):
             )
     return stderr.strip()
 
-
-def ensure_logging_branch(repo_path: pathlib.Path):
-    """Ensure the 'logging' branch exists and is checked out in a project repo.
-    Stashes uncommitted changes, switches to logging, and returns context
-    that restore_original_branch() uses to switch back."""
-    original_branch = _git_run(["branch", "--show-current"], cwd=repo_path).stdout.strip()
-
-    # Already on logging — nothing to do
-    if original_branch == "logging":
-        return {"repo_path": repo_path, "original_branch": None, "had_stash": False}
-
-    # Check for uncommitted changes
-    status = _git_run(["status", "--porcelain"], cwd=repo_path)
-    has_changes = bool(status.stdout.strip())
-
-    if has_changes:
-        _git_run(["stash", "push", "-m", "pod-sync-auto-stash"], cwd=repo_path)
-
-    branches = _git_run(["branch", "--list", "logging"], cwd=repo_path).stdout.strip()
-
-    try:
-        if "logging" not in branches:
-            _git_run(["checkout", "-b", "logging"], cwd=repo_path, check=True)
-        else:
-            _git_run(["checkout", "logging"], cwd=repo_path, check=True)
-    except subprocess.CalledProcessError as e:
-        # Failed to switch — restore stash on current branch and raise
-        if has_changes:
-            _git_run(["stash", "pop"], cwd=repo_path)
-        raise RuntimeError(f"Failed to switch to logging branch: {e.stderr}")
-
-    return {"repo_path": repo_path, "original_branch": original_branch, "had_stash": has_changes}
-
-
-def restore_original_branch(ctx):
-    """Switch back to the original branch after a logging branch operation.
-    Pops the stash on the original branch (not on logging)."""
-    repo_path = ctx["repo_path"]
-    original = ctx["original_branch"]
-    had_stash = ctx["had_stash"]
-
-    if original is None:
-        return
-
-    try:
-        _git_run(["checkout", original], cwd=repo_path, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[branch-restore] warning: could not switch back to {original}: {e.stderr}", file=sys.stderr)
-        return
-
-    if had_stash:
-        _git_run(["stash", "pop"], cwd=repo_path)
-
 # ---------------------------------------------------------------------------
-# Helpers — heartbeat (writes to each registered project repo's logging branch)
+# Helpers — logging worktree
+#
+# Pod-Sync does all logging-branch work in a hidden worktree, never in the
+# user's checkout. No stashing, no branch switching, no races with the
+# user's editor or agent.
 # ---------------------------------------------------------------------------
 
-def _write_heartbeat_to_repo(repo_path_str: str):
-    """Write heartbeat to a single project repo's logging branch. Fails silently."""
+_REPO_LOCKS = {}
+_REPO_LOCKS_GUARD = threading.Lock()
+
+
+def _repo_lock(repo_path) -> threading.Lock:
+    """One lock per project repo, shared by tool calls and the dashboard."""
+    key = str(pathlib.Path(repo_path).resolve())
+    with _REPO_LOCKS_GUARD:
+        return _REPO_LOCKS.setdefault(key, threading.Lock())
+
+
+def _worktree_path(repo: pathlib.Path) -> pathlib.Path:
+    digest = hashlib.sha1(str(repo).encode()).hexdigest()[:12]
+    return WORKTREES_DIR / f"{repo.name}-{digest}"
+
+
+def _ref_exists(ref: str, cwd) -> bool:
+    return _git_run(["rev-parse", "--verify", "--quiet", ref], cwd=cwd).returncode == 0
+
+
+def _ensure_logging_branch_exists(repo: pathlib.Path):
+    """Create the local logging branch if missing.
+
+    Bases it on origin/logging when the remote branch exists (so teammates
+    share one history), otherwise creates an orphan branch with an empty
+    tree so no project code ever leaks onto the logging branch."""
+    if _ref_exists("refs/heads/logging", repo):
+        return
+
+    _git_run(["fetch", "origin", "logging"], cwd=repo)
+    if _ref_exists("refs/remotes/origin/logging", repo):
+        result = _git_run(["branch", "--track", "logging", "origin/logging"], cwd=repo)
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not create logging branch: {result.stderr.strip()}")
+        return
+
+    tree = _git_run(["mktree"], cwd=repo, input_text="")
+    if tree.returncode != 0:
+        raise RuntimeError(f"Could not create logging branch: {tree.stderr.strip()}")
+    commit = _git_run(
+        ["commit-tree", tree.stdout.strip(), "-m", "pod-sync: initialize logging branch"],
+        cwd=repo
+    )
+    if commit.returncode != 0:
+        raise RuntimeError(f"Could not create logging branch: {commit.stderr.strip()}")
+    result = _git_run(["branch", "logging", commit.stdout.strip()], cwd=repo)
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not create logging branch: {result.stderr.strip()}")
+
+
+def ensure_logging_worktree(repo_path) -> pathlib.Path:
+    """Return a directory where the logging branch is checked out.
+
+    Normally a hidden worktree under WORKTREES_DIR. If the user happens to
+    have the logging branch checked out in their own working tree, that
+    checkout is used directly (a branch can only be checked out once)."""
+    repo = pathlib.Path(repo_path).resolve()
+    if _git_run(["rev-parse", "--git-dir"], cwd=repo).returncode != 0:
+        raise RuntimeError(f"Not a git repository: {repo}")
+
+    if _git_run(["branch", "--show-current"], cwd=repo).stdout.strip() == "logging":
+        return repo
+
+    wt = _worktree_path(repo)
+    if (wt / ".git").exists() and _git_run(["rev-parse", "--git-dir"], cwd=wt).returncode == 0:
+        return wt
+
+    # Stale or missing — rebuild it.
+    if wt.exists():
+        shutil.rmtree(wt, ignore_errors=True)
+    _git_run(["worktree", "prune"], cwd=repo)
+    _ensure_logging_branch_exists(repo)
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    result = _git_run(["worktree", "add", str(wt), "logging"], cwd=repo)
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not create pod-sync worktree: {result.stderr.strip()}")
+    return wt
+
+
+def _sync_worktree(wt: pathlib.Path):
+    """Pull the latest logging branch into the worktree. Returns (ok, err).
+    A missing remote branch is fine — the first push will create it."""
+    ok, err = _git_pull_branch("logging", cwd=wt)
+    if not ok and "couldn't find remote ref" in err.lower():
+        return True, ""
+    return ok, err
+
+# ---------------------------------------------------------------------------
+# Helpers — entry store (per-author JSONL files on the logging branch)
+# ---------------------------------------------------------------------------
+
+def _author_file(wt: pathlib.Path, slug: str) -> pathlib.Path:
+    return wt / "entries" / f"{slug}.jsonl"
+
+
+def _load_worktree_entries(wt: pathlib.Path, include_archive=False, weeks=None) -> list:
+    """Load all authors' entries, plus legacy single-file stores if present."""
+    entries = []
+
+    legacy = wt / "entries.json"
+    if legacy.exists():
+        try:
+            entries += json.loads(legacy.read_text())
+        except json.JSONDecodeError:
+            pass
+
+    entries_dir = wt / "entries"
+    if entries_dir.is_dir():
+        for f in sorted(entries_dir.glob("*.jsonl")):
+            entries += read_jsonl(f)
+
+    if include_archive and weeks:
+        archive_dir = wt / "archive"
+        for week in weeks:
+            legacy_archive = archive_dir / f"{week}.json"
+            if legacy_archive.exists():
+                try:
+                    entries += json.loads(legacy_archive.read_text())
+                except json.JSONDecodeError:
+                    pass
+            for f in sorted(archive_dir.glob(f"*-{week}.jsonl")):
+                entries += read_jsonl(f)
+
+    return entries
+
+
+def archive_old_entries(wt: pathlib.Path, slug: str):
+    """Move this author's entries older than 90 days into weekly archive files.
+    Only touches the author's own files so teammates never conflict.
+    No-op if nothing qualifies."""
     try:
-        repo = pathlib.Path(repo_path_str)
-        if not repo.exists():
+        author_file = _author_file(wt, slug)
+        entries = read_jsonl(author_file)
+        cutoff = datetime.now() - timedelta(days=90)
+
+        to_keep, to_archive = [], []
+        for e in entries:
+            d = _parse_date(e.get("date", ""))
+            if d != datetime.min and d < cutoff:
+                to_archive.append(e)
+            else:
+                to_keep.append(e)
+
+        if not to_archive:
             return
 
-        branch_ctx = ensure_logging_branch(repo)
-        try:
-            # Pull latest logging branch
-            _git_pull_branch("logging", cwd=repo)
+        by_week = {}
+        for entry in to_archive:
+            week = datetime.strptime(entry["date"], "%Y-%m-%d").strftime("%G-W%V")
+            by_week.setdefault(week, []).append(entry)
 
-            presence_path = repo / "heartbeat" / "presence.json"
-            presence_path.parent.mkdir(parents=True, exist_ok=True)
-            presence = json.loads(presence_path.read_text()) if presence_path.exists() else {}
+        for week, week_entries in by_week.items():
+            archive_path = wt / "archive" / f"{slug}-{week}.jsonl"
+            write_jsonl(archive_path, read_jsonl(archive_path) + week_entries)
 
-            author = git_config_username()
-
-            presence[author] = {
-                "last_seen": now_iso(),
-                "branch": branch_ctx.get("original_branch") or "logging",
-            }
-            atomic_write(presence_path, presence)
-
-            # Commit and push with retry logic
-            _git_commit_and_push(
-                f"heartbeat: {author} — {now_iso()}",
-                paths=["heartbeat/"],
-                branch="logging",
-                cwd=repo
-            )
-        finally:
-            restore_original_branch(branch_ctx)
+        write_jsonl(author_file, to_keep)
     except Exception as e:
-        print(f"[heartbeat] warning ({repo_path_str}): {e}", file=sys.stderr)
+        print(f"[archive] warning: {e}", file=sys.stderr)
 
+# ---------------------------------------------------------------------------
+# Helpers — presence (derived from commit activity, no heartbeat)
+# ---------------------------------------------------------------------------
 
-def _heartbeat_loop():
-    """Background thread: update heartbeat in all registered repos every 10 minutes."""
-    while True:
-        time.sleep(HEARTBEAT_INTERVAL)
-        config = load_config()
-        for repo_path in config.get("registered_repos", []):
-            _write_heartbeat_to_repo(repo_path)
+def derive_presence(project: pathlib.Path) -> dict:
+    """Who has pushed commits recently, derived from origin's branches.
+
+    Returns {author: {"last_seen": iso_ts, "branch": name}}. Read-only:
+    a fetch updates remote-tracking refs but never touches the working tree.
+    """
+    _git_run(["fetch", "origin", "--quiet"], cwd=project)  # best effort; offline → stale refs
+    result = _git_run(
+        ["log", "--remotes=origin", "--source", f"--since={PRESENCE_LOOKBACK}",
+         "--date=iso-strict", "--format=%an%x09%aI%x09%S"],
+        cwd=project
+    )
+    # --source may attribute a commit to origin/HEAD; translate that to the
+    # default branch's real name.
+    head_target = _git_run(
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=project
+    ).stdout.strip()
+    presence = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, ts, ref = parts
+        if name in presence:
+            continue  # log is newest-first, so the first hit per author wins
+        branch = head_target if (ref.endswith("/HEAD") and head_target) else ref
+        for prefix in ("refs/remotes/origin/", "origin/"):
+            if branch.startswith(prefix):
+                branch = branch[len(prefix):]
+                break
+        presence[name] = {"last_seen": ts, "branch": branch}
+    return presence
 
 # ---------------------------------------------------------------------------
 # CLI command — install-skills
@@ -436,127 +556,107 @@ def cmd_install_skills(target=None):
 
 def startup():
     """Run once at server start in both modes.
-    No data files to create in the pod-sync repo — data lives in project repos."""
+    No data files to create — data lives on project repos' logging branches."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Initial heartbeat + loop in background
-    def _initial_push_and_loop():
-        config = load_config()
-        for repo_path in config.get("registered_repos", []):
-            _write_heartbeat_to_repo(repo_path)
-        _heartbeat_loop()
-
-    t = threading.Thread(target=_initial_push_and_loop, daemon=True)
-    t.start()
 
 # ---------------------------------------------------------------------------
 # Tool logic — shared by MCP and HTTP modes
-# All data operations target the project repo's logging branch.
+# All data operations target the project repo's logging branch via the
+# hidden worktree. The user's working tree is never touched.
 # ---------------------------------------------------------------------------
 
-def tool_log_status(summary: str, repo_path: str, files_touched: list = None, blockers: str = "None", next_up: str = "") -> str:
+def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
+                    blockers: str = "None", next_up: str = "", mode: str = "new") -> str:
     """Log an end-of-day status entry to the project repo's logging branch."""
     if files_touched is None:
         files_touched = []
-
-    author = git_config_username()
-    if author == "Unknown":
-        return "Error: git config user.name is not set. Run: git config --global user.name \"Your Name\""
 
     project = pathlib.Path(repo_path)
     if not project.exists():
         return f"Error: repo_path does not exist: {repo_path}"
 
-    repo_name = get_repo_name_from_path(project)
-    date = today_iso()
+    author = git_config_username(cwd=project)
+    if author == "Unknown":
+        return "Error: git config user.name is not set. Run: git config --global user.name \"Your Name\""
 
-    # Detect replace/update prefix BEFORE the duplicate check
-    replace_mode = False
-    update_mode = False
+    # Compatibility with the older prefix protocol.
     if summary.startswith("[replace] "):
         summary = summary[len("[replace] "):]
-        replace_mode = True
+        mode = "replace"
     elif summary.startswith("[update] "):
         summary = summary[len("[update] "):]
-        update_mode = True
+        mode = "update"
 
-    # Switch to logging branch
-    try:
-        branch_ctx = ensure_logging_branch(project)
-    except RuntimeError as e:
-        return f"Error switching to logging branch: {e}"
+    if mode not in ("new", "update", "replace"):
+        return f"Error: invalid mode '{mode}'. Use 'new', 'update', or 'replace'."
 
-    try:
-        # Pull fresh data
-        _git_pull_branch("logging", cwd=project)
+    repo_name = get_repo_name_from_path(project)
+    date = today_iso()
+    slug = author_slug(author)
 
-        # Ensure data files exist on logging branch
-        entries_path = project / "entries.json"
-        archive_dir = project / "archive"
-        entries_path.parent.mkdir(parents=True, exist_ok=True)
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        if not entries_path.exists():
-            atomic_write(entries_path, [])
+    with _repo_lock(project):
+        try:
+            wt = ensure_logging_worktree(project)
+        except RuntimeError as e:
+            return f"Error preparing logging worktree: {e}"
 
-        # Check for duplicate entry today — skip when a directive is present
-        if not replace_mode and not update_mode:
-            entries = load_entries(project)
-            existing_today = [e for e in entries if e.get("author") == author and e.get("date") == date and e.get("type") == "status"]
-            if existing_today:
-                restore_original_branch(branch_ctx)
-                return (
-                    f"You already have a status entry for today ({date}). "
-                    f"Would you like to:\n"
-                    f"  1. Append as a mid-day update (call again with summary prefixed with '[update] ')\n"
-                    f"  2. Replace the existing entry (call again with summary prefixed with '[replace] ')\n"
-                    f"Do not overwrite silently."
-                )
+        try:
+            sync_ok, sync_err = _sync_worktree(wt)
 
-        entry = {
-            "id": str(uuid4()),
-            "type": "status",
-            "author": author,
-            "repo": repo_name,
-            "date": date,
-            "week": iso_week(),
-            "timestamp": now_iso(),
-            "summary": summary,
-            "files_touched": files_touched,
-            "blockers": blockers,
-            "next_up": next_up,
-            "archived": False,
-        }
+            author_file = _author_file(wt, slug)
+            entries = read_jsonl(author_file)
 
-        entries = load_entries(project)
+            if mode == "new":
+                existing_today = [e for e in entries if e.get("date") == date and e.get("type") == "status"]
+                if existing_today:
+                    return (
+                        f"You already have a status entry for today ({date}). "
+                        f"Would you like to:\n"
+                        f"  1. Append as a mid-day update (call again with mode=\"update\")\n"
+                        f"  2. Replace the existing entry (call again with mode=\"replace\")\n"
+                        f"Do not overwrite silently."
+                    )
 
-        # Remove today's entry if replacing
-        if replace_mode:
-            entries = [e for e in entries if not (e.get("author") == author and e.get("date") == date and e.get("type") == "status")]
+            entry = {
+                "id": str(uuid4()),
+                "type": "status",
+                "author": author,
+                "repo": repo_name,
+                "date": date,
+                "week": iso_week(),
+                "timestamp": now_iso(),
+                "summary": summary,
+                "files_touched": files_touched,
+                "blockers": blockers,
+                "next_up": next_up,
+                "archived": False,
+            }
 
-        entries.append(entry)
-        atomic_write(entries_path, entries)
-        archive_old_entries(project)
+            if mode == "replace":
+                entries = [e for e in entries if not (e.get("date") == date and e.get("type") == "status")]
 
-        ok, err = _git_commit_and_push(
-            f"status: {author} — {date}",
-            paths=["entries.json", "archive/"],
-            branch="logging",
-            cwd=project
-        )
+            entries.append(entry)
+            write_jsonl(author_file, entries)
+            archive_old_entries(wt, slug)
 
-        restore_original_branch(branch_ctx)
+            ok, err = _git_commit_and_push(
+                f"status: {author} — {date}",
+                paths=["entries", "archive"],
+                branch="logging",
+                cwd=wt
+            )
+        except Exception as e:
+            return f"Error logging status: {e}"
 
-        if not ok:
-            return f"Entry saved locally but push failed: {err}"
+    register_repo(str(project.resolve()))
 
-        # Auto-register this repo
-        register_repo(str(project))
+    if not ok:
+        return f"Entry saved locally but push failed: {err}"
 
-        return f"Logged and pushed to {repo_name}/logging. ({author}, {date})"
-
-    except Exception as e:
-        restore_original_branch(branch_ctx)
-        return f"Error logging status: {e}"
+    msg = f"Logged and pushed to {repo_name}/logging (entries/{slug}.jsonl). ({author}, {date})"
+    if not sync_ok:
+        msg += f"\nNote: could not sync with origin before writing ({sync_err})."
+    return msg
 
 
 def tool_read_status(repo_path: str, who: str = "all", when: str = "latest", query: str = "") -> str:
@@ -565,134 +665,124 @@ def tool_read_status(repo_path: str, who: str = "all", when: str = "latest", que
     if not project.exists():
         return f"Error: repo_path does not exist: {repo_path}"
 
-    try:
-        branch_ctx = ensure_logging_branch(project)
-    except RuntimeError as e:
-        return f"Error switching to logging branch: {e}"
+    # Determine date range and whether archive is needed (no I/O yet)
+    now = datetime.now()
+    date_start = None
+    date_end = None
+    need_archive = False
+    archive_weeks = []
 
-    try:
-        _git_pull_branch("logging", cwd=project)
-
-        # Ensure entries.json exists
-        entries_path = project / "entries.json"
-        if not entries_path.exists():
-            restore_original_branch(branch_ctx)
-            return "No entries found — this repo has no status log yet."
-
-        # Determine date range and whether archive is needed
-        now = datetime.now()
-        date_start = None
-        date_end = None
-        need_archive = False
-        archive_weeks = []
-
-        if when == "today":
-            date_start = date_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif when == "yesterday":
-            yesterday = now - timedelta(days=1)
-            date_start = date_end = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif when == "this week":
-            date_start = now - timedelta(days=now.weekday())
-            date_start = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
-            date_end = now
-        elif when == "last week":
-            date_start = now - timedelta(days=now.weekday() + 7)
-            date_start = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
-            date_end = date_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
-        elif ":" in when:
-            parts = when.split(":")
-            try:
-                date_start = datetime.strptime(parts[0], "%Y-%m-%d")
-                date_end = datetime.strptime(parts[1], "%Y-%m-%d").replace(hour=23, minute=59, second=59)
-            except (ValueError, IndexError):
-                restore_original_branch(branch_ctx)
-                return f"Invalid date range format: {when}. Use YYYY-MM-DD:YYYY-MM-DD."
-        elif when != "latest":
-            try:
-                date_start = datetime.strptime(when, "%Y-%m-%d")
-                date_end = date_start.replace(hour=23, minute=59, second=59)
-            except ValueError:
-                restore_original_branch(branch_ctx)
-                return f"Invalid date format: {when}. Use YYYY-MM-DD."
-
-        # Check if we need archive data
-        if date_start:
-            cutoff = now - timedelta(days=90)
-            if date_start < cutoff:
-                need_archive = True
-                end = date_end or now
-                seen_weeks = set()
-                d = date_start
-                while d <= end:
-                    w = d.strftime("%G-W%V")
-                    if w not in seen_weeks:
-                        seen_weeks.add(w)
-                        archive_weeks.append(w)
-                    d += timedelta(days=1)
-
-        entries = load_entries(project, include_archive=need_archive, weeks=archive_weeks)
-
-        restore_original_branch(branch_ctx)
-
-        # Filter by author
-        if who != "all":
-            entries = [e for e in entries if who.lower() in e.get("author", "").lower()]
-
-        # Filter by date
-        if when == "latest":
-            by_author = {}
-            for e in sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True):
-                a = e.get("author", "Unknown")
-                if a not in by_author:
-                    by_author[a] = e
-            entries = list(by_author.values())
-        elif date_start:
-            entries = [
-                e for e in entries
-                if date_start <= _parse_date(e.get("date", "")) <= (date_end or now)
-            ]
-
-        # Keyword filter
-        if query:
-            q = query.lower()
-            entries = [
-                e for e in entries
-                if q in e.get("summary", "").lower()
-                or q in e.get("title", "").lower()
-                or q in " ".join(e.get("files_touched", [])).lower()
-            ]
-
-        if not entries:
-            return "No entries found for that query."
-
-        entries.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-
-        lines = []
-        for e in entries:
-            if e.get("type") == "status":
-                lines.append(
-                    f"{e.get('author', 'Unknown')}  ({e.get('date', '')})\n"
-                    f"  {e.get('summary', '')}\n"
-                    f"  Blockers: {e.get('blockers', 'None')}\n"
-                    f"  Next up: {e.get('next_up', '')}"
-                )
-            elif e.get("type") == "openspec_proposal":
-                lines.append(
-                    f"{e.get('author', 'Unknown')}  ({e.get('date', '')})  [openspec]\n"
-                    f"  {e.get('title', 'Untitled')}\n"
-                    f"  Repo: {e.get('repo', '')} / {e.get('branch', 'logging')}\n"
-                    f"  Event: {e.get('event_type', '')}"
-                )
-            lines.append("")
-
-        return "\n".join(lines).strip()
-
-    except Exception as e:
+    if when == "today":
+        date_start = date_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif when == "yesterday":
+        yesterday = now - timedelta(days=1)
+        date_start = date_end = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif when == "this week":
+        date_start = now - timedelta(days=now.weekday())
+        date_start = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_end = now
+    elif when == "last week":
+        date_start = now - timedelta(days=now.weekday() + 7)
+        date_start = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_end = date_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    elif ":" in when:
+        parts = when.split(":")
         try:
-            restore_original_branch(branch_ctx)
-        except Exception:
-            pass
-        return f"Error reading status: {e}"
+            date_start = datetime.strptime(parts[0], "%Y-%m-%d")
+            date_end = datetime.strptime(parts[1], "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        except (ValueError, IndexError):
+            return f"Invalid date range format: {when}. Use YYYY-MM-DD:YYYY-MM-DD."
+    elif when != "latest":
+        try:
+            date_start = datetime.strptime(when, "%Y-%m-%d")
+            date_end = date_start.replace(hour=23, minute=59, second=59)
+        except ValueError:
+            return f"Invalid date format: {when}. Use YYYY-MM-DD."
+
+    # Check if we need archive data
+    if date_start:
+        cutoff = now - timedelta(days=90)
+        if date_start < cutoff:
+            need_archive = True
+            end = date_end or now
+            seen_weeks = set()
+            d = date_start
+            while d <= end:
+                w = d.strftime("%G-W%V")
+                if w not in seen_weeks:
+                    seen_weeks.add(w)
+                    archive_weeks.append(w)
+                d += timedelta(days=1)
+
+    with _repo_lock(project):
+        try:
+            wt = ensure_logging_worktree(project)
+        except RuntimeError as e:
+            return f"Error preparing logging worktree: {e}"
+        try:
+            sync_ok, sync_err = _sync_worktree(wt)
+            entries = _load_worktree_entries(wt, include_archive=need_archive, weeks=archive_weeks)
+        except Exception as e:
+            return f"Error reading status: {e}"
+
+    if not entries:
+        return "No entries found — this repo has no status log yet."
+
+    # Filter by author
+    if who != "all":
+        entries = [e for e in entries if who.lower() in e.get("author", "").lower()]
+
+    # Filter by date
+    if when == "latest":
+        by_author = {}
+        for e in sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True):
+            a = e.get("author", "Unknown")
+            if a not in by_author:
+                by_author[a] = e
+        entries = list(by_author.values())
+    elif date_start:
+        entries = [
+            e for e in entries
+            if date_start <= _parse_date(e.get("date", "")) <= (date_end or now)
+        ]
+
+    # Keyword filter
+    if query:
+        q = query.lower()
+        entries = [
+            e for e in entries
+            if q in e.get("summary", "").lower()
+            or q in e.get("title", "").lower()
+            or q in " ".join(e.get("files_touched", [])).lower()
+        ]
+
+    if not entries:
+        return "No entries found for that query."
+
+    entries.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+    lines = []
+    if not sync_ok:
+        lines.append(f"(warning: could not sync with origin — showing last known data: {sync_err})")
+        lines.append("")
+    for e in entries:
+        if e.get("type") == "status":
+            lines.append(
+                f"{e.get('author', 'Unknown')}  ({e.get('date', '')})\n"
+                f"  {e.get('summary', '')}\n"
+                f"  Blockers: {e.get('blockers', 'None')}\n"
+                f"  Next up: {e.get('next_up', '')}"
+            )
+        elif e.get("type") == "openspec_proposal":
+            lines.append(
+                f"{e.get('author', 'Unknown')}  ({e.get('date', '')})  [openspec]\n"
+                f"  {e.get('title', 'Untitled')}\n"
+                f"  Repo: {e.get('repo', '')} / {e.get('branch', 'logging')}\n"
+                f"  Event: {e.get('event_type', '')}"
+            )
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def tool_log_openspec_event(
@@ -702,194 +792,158 @@ def tool_log_openspec_event(
     event_type: str = "proposal_created",
     openspec_path: str = "openspec/changes/",
     notes: str = "",
+    proposal_files: Optional[dict] = None,
 ) -> str:
-    """Commit proposal to project repo logging branch and log event to entries.json on same branch."""
-    author = git_config_username()
+    """Write proposal files and the event record to the project repo's logging
+    branch in a single commit."""
+    project = pathlib.Path(repo_path)
+    if not project.exists():
+        return f"Error: repo_path does not exist: {repo_path}"
+
+    author = git_config_username(cwd=project)
     if author == "Unknown":
         return "Error: git config user.name is not set. Run: git config --global user.name \"Your Name\""
 
-    project = pathlib.Path(repo_path)
-    if not project.exists():
-        return f"Error: repo_path does not exist: {repo_path}"
+    slug = author_slug(author)
 
-    # Switch to logging branch
-    try:
-        branch_ctx = ensure_logging_branch(project)
-    except RuntimeError as e:
-        return f"Error switching to logging branch: {e}"
-
-    try:
-        # Pull latest
-        _git_pull_branch("logging", cwd=project)
-
-        # Stage and commit proposal files
-        result = _git_run(["add", openspec_path], cwd=project)
-
-        # Also ensure entries.json exists
-        entries_path = project / "entries.json"
-        if not entries_path.exists():
-            atomic_write(entries_path, [])
-
-        # Build event and append to entries.json (same branch, single write)
-        event = {
-            "id": str(uuid4()),
-            "type": "openspec_proposal",
-            "author": author,
-            "date": today_iso(),
-            "week": iso_week(),
-            "timestamp": now_iso(),
-            "title": title,
-            "repo": repo,
-            "branch": "logging",
-            "path": openspec_path,
-            "event_type": event_type,
-            "notes": notes,
-            "archived": False,
-        }
-
-        entries = load_entries(project)
-        entries.append(event)
-        atomic_write(entries_path, entries)
-
-        # Commit everything together
-        _git_run(["add", openspec_path, "entries.json"], cwd=project)
-        result = _git_run(
-            ["commit", "-m", f"openspec: {title} ({event_type})"],
-            cwd=project
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            if "nothing to commit" not in stderr and "nothing to commit" not in stdout:
-                restore_original_branch(branch_ctx)
-                return f"Error committing to project repo: {stderr}"
-
-        result = _git_run(["push", "origin", "logging"], cwd=project)
-        if result.returncode != 0:
-            restore_original_branch(branch_ctx)
-            return f"Error pushing to project repo logging branch: {_classify_git_error(result.stderr)}"
-
-        restore_original_branch(branch_ctx)
-
-        # Auto-register this repo
-        register_repo(str(project))
-
-        return (
-            f"OpenSpec event logged. "
-            f"Proposal committed to {repo}/logging. "
-            f"Event visible in team dashboard."
-        )
-
-    except Exception as e:
+    with _repo_lock(project):
         try:
-            restore_original_branch(branch_ctx)
-        except Exception:
-            pass
-        return f"Error logging openspec event: {e}"
+            wt = ensure_logging_worktree(project)
+        except RuntimeError as e:
+            return f"Error preparing logging worktree: {e}"
+
+        try:
+            _sync_worktree(wt)
+
+            # Write proposal content onto the logging branch. The agent passes
+            # file contents — it never writes to the user's working tree.
+            if proposal_files:
+                wt_resolved = wt.resolve()
+                for rel, content in proposal_files.items():
+                    target = wt / rel
+                    try:
+                        target.resolve().relative_to(wt_resolved)
+                    except ValueError:
+                        return f"Error: proposal file path escapes the repo: {rel}"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content)
+
+            event = {
+                "id": str(uuid4()),
+                "type": "openspec_proposal",
+                "author": author,
+                "date": today_iso(),
+                "week": iso_week(),
+                "timestamp": now_iso(),
+                "title": title,
+                "repo": repo,
+                "branch": "logging",
+                "path": openspec_path,
+                "event_type": event_type,
+                "notes": notes,
+                "archived": False,
+            }
+
+            author_file = _author_file(wt, slug)
+            entries = read_jsonl(author_file)
+            entries.append(event)
+            write_jsonl(author_file, entries)
+
+            ok, err = _git_commit_and_push(
+                f"openspec: {title} ({event_type})",
+                paths=[openspec_path, "entries"],
+                branch="logging",
+                cwd=wt
+            )
+        except Exception as e:
+            return f"Error logging openspec event: {e}"
+
+    register_repo(str(project.resolve()))
+
+    if not ok:
+        return f"OpenSpec event saved locally but push failed: {err}"
+
+    return (
+        f"OpenSpec event logged. "
+        f"Proposal committed to {repo}/logging. "
+        f"Event visible in team dashboard."
+    )
 
 
 def tool_read_presence(repo_path: str) -> str:
-    """Show who on the team is currently active in a specific project repo."""
+    """Show who on the team is recently active in a specific project repo,
+    derived from commit activity on origin."""
     project = pathlib.Path(repo_path)
     if not project.exists():
         return f"Error: repo_path does not exist: {repo_path}"
 
     try:
-        branch_ctx = ensure_logging_branch(project)
-    except RuntimeError as e:
-        return f"Error switching to logging branch: {e}"
-
-    try:
-        _git_pull_branch("logging", cwd=project)
-
-        presence_path = project / "heartbeat" / "presence.json"
-        presence = json.loads(presence_path.read_text()) if presence_path.exists() else {}
-
-        restore_original_branch(branch_ctx)
-
-        if not presence:
-            return "No presence data found. No teammates have started Pod-Sync for this repo yet."
-
-        now = datetime.now()
-        active = []
-        away = []
-
-        for name, info in presence.items():
-            try:
-                last_seen = datetime.strptime(info["last_seen"], "%Y-%m-%dT%H:%M:%S")
-                delta = now - last_seen
-                minutes = int(delta.total_seconds() / 60)
-            except (ValueError, KeyError):
-                minutes = 9999
-
-            branch = info.get("branch", "unknown")
-
-            if minutes <= 30:
-                if minutes < 1:
-                    time_str = "just now"
-                else:
-                    time_str = f"{minutes} min ago"
-                active.append(f"  {name}  — last seen {time_str}  — {branch}")
-            else:
-                if minutes < 60:
-                    time_str = f"{minutes} min ago"
-                elif minutes < 1440:
-                    time_str = f"{minutes // 60}h ago"
-                else:
-                    time_str = f"{minutes // 1440}d ago"
-                away.append(f"  {name}  — last seen {time_str}")
-
-        lines = ["Active now:"]
-        lines.extend(active if active else ["  (nobody)"])
-        lines.append("")
-        lines.append("Away:")
-        lines.extend(away if away else ["  (nobody)"])
-
-        return "\n".join(lines)
-
+        presence = derive_presence(project)
     except Exception as e:
-        try:
-            restore_original_branch(branch_ctx)
-        except Exception:
-            pass
         return f"Error reading presence: {e}"
 
+    if not presence:
+        return (
+            "No recent activity found — nobody has pushed commits to this "
+            "repo's origin in the last 7 days."
+        )
+
+    now = datetime.now(timezone.utc)
+    active = []
+    away = []
+
+    for name, info in presence.items():
+        last_seen = _parse_ts(info.get("last_seen", ""))
+        minutes = 9999 if last_seen is None else int((now - last_seen).total_seconds() / 60)
+        branch = info.get("branch", "unknown")
+
+        if minutes <= ACTIVE_WINDOW_MINUTES:
+            time_str = "just now" if minutes < 1 else f"{minutes} min ago"
+            active.append(f"  {name}  — last push {time_str}  — {branch}")
+        else:
+            if minutes < 60:
+                time_str = f"{minutes} min ago"
+            elif minutes < 1440:
+                time_str = f"{minutes // 60}h ago"
+            else:
+                time_str = f"{minutes // 1440}d ago"
+            away.append(f"  {name}  — last push {time_str}")
+
+    lines = ["Presence (derived from commit activity on origin):", "", "Active now:"]
+    lines.extend(active if active else ["  (nobody)"])
+    lines.append("")
+    lines.append("Away:")
+    lines.extend(away if away else ["  (nobody)"])
+
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
-# Helper — read repo data for the web UI (switches branch, reads, restores)
+# Helpers — repo data for the web UI
 # ---------------------------------------------------------------------------
 
-def _read_repo_entries(repo_path_str: str) -> list:
-    """Read entries.json from a project repo's logging branch. Returns list."""
-    try:
-        project = pathlib.Path(repo_path_str)
-        if not project.exists():
-            return []
-        branch_ctx = ensure_logging_branch(project)
-        try:
-            _git_pull_branch("logging", cwd=project)
-            entries_path = project / "entries.json"
-            return json.loads(entries_path.read_text()) if entries_path.exists() else []
-        finally:
-            restore_original_branch(branch_ctx)
-    except Exception as e:
-        print(f"[read-entries] warning ({repo_path_str}): {e}", file=sys.stderr)
+def load_repo_entries(repo_path_str: str) -> list:
+    """Read all entries from a project repo's logging branch. Returns list."""
+    project = pathlib.Path(repo_path_str)
+    if not project.exists():
         return []
-
-
-def _read_repo_presence(repo_path_str: str) -> dict:
-    """Read presence.json from a project repo's logging branch. Returns dict."""
-    try:
-        project = pathlib.Path(repo_path_str)
-        if not project.exists():
-            return {}
-        branch_ctx = ensure_logging_branch(project)
+    with _repo_lock(project):
         try:
-            _git_pull_branch("logging", cwd=project)
-            presence_path = project / "heartbeat" / "presence.json"
-            return json.loads(presence_path.read_text()) if presence_path.exists() else {}
-        finally:
-            restore_original_branch(branch_ctx)
+            wt = ensure_logging_worktree(project)
+            _sync_worktree(wt)
+            return _load_worktree_entries(wt)
+        except Exception as e:
+            print(f"[read-entries] warning ({repo_path_str}): {e}", file=sys.stderr)
+            return []
+
+
+def load_repo_presence(repo_path_str: str) -> dict:
+    """Derived presence for a project repo. Returns dict."""
+    project = pathlib.Path(repo_path_str)
+    if not project.exists():
+        return {}
+    try:
+        return derive_presence(project)
     except Exception as e:
         print(f"[read-presence] warning ({repo_path_str}): {e}", file=sys.stderr)
         return {}
@@ -899,11 +953,11 @@ def _build_repo_summary(repo_path_str: str) -> dict:
     """Build summary data for a single repo (used by /api/repos)."""
     project = pathlib.Path(repo_path_str)
     name = get_repo_name_from_path(project)
-    entries = _read_repo_entries(repo_path_str)
-    presence = _read_repo_presence(repo_path_str)
+    entries = load_repo_entries(repo_path_str)
+    presence = load_repo_presence(repo_path_str)
 
     today = today_iso()
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     # Count who logged today
     logged_today = set()
@@ -916,12 +970,9 @@ def _build_repo_summary(repo_path_str: str) -> dict:
     members = set()
     for member_name, info in presence.items():
         members.add(member_name)
-        try:
-            last_seen = datetime.strptime(info["last_seen"], "%Y-%m-%dT%H:%M:%S")
-            if (now - last_seen).total_seconds() <= 1800:
-                active_count += 1
-        except (ValueError, KeyError):
-            pass
+        last_seen = _parse_ts(info.get("last_seen", ""))
+        if last_seen and (now - last_seen).total_seconds() <= ACTIVE_WINDOW_MINUTES * 60:
+            active_count += 1
 
     # Also add authors from entries as members
     for e in entries:
@@ -944,192 +995,40 @@ def _build_repo_summary(repo_path_str: str) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Background HTTP dashboard (spawned as daemon thread in stdio mode)
+# HTTP app — one factory shared by --http mode and the stdio-mode dashboard
 # ---------------------------------------------------------------------------
 
-def _start_http_background():
-    """Spawn the HTTP dashboard in a daemon thread (used during stdio mode)."""
-    def _run():
-        try:
-            from fastapi import FastAPI
-            from fastapi.responses import HTMLResponse, JSONResponse
-            import uvicorn
-
-            app = FastAPI(title="Pod-Sync")
-
-            @app.get("/", response_class=HTMLResponse)
-            async def serve_ui():
-                if WEB_UI_PATH.exists():
-                    return HTMLResponse(WEB_UI_PATH.read_text())
-                return HTMLResponse("<h1>Pod-Sync</h1><p>web-ui/index.html not found.</p>")
-
-            @app.get("/api/repos")
-            async def api_repos():
-                config = load_config()
-                repos = []
-                for rp in config.get("registered_repos", []):
-                    repos.append(_build_repo_summary(rp))
-                return JSONResponse(repos)
-
-            @app.get("/api/repo/entries")
-            async def api_repo_entries(path: str = ""):
-                if not path:
-                    return JSONResponse([])
-                return JSONResponse(_read_repo_entries(path))
-
-            @app.get("/api/repo/presence")
-            async def api_repo_presence(path: str = ""):
-                if not path:
-                    return JSONResponse({})
-                return JSONResponse(_read_repo_presence(path))
-
-            @app.get("/api/repo/search")
-            async def api_repo_search(path: str = "", q: str = ""):
-                if not path or not q:
-                    return JSONResponse([])
-                entries = _read_repo_entries(path)
-                q_lower = q.lower()
-                results = [
-                    e for e in entries
-                    if q_lower in e.get("summary", "").lower()
-                    or q_lower in e.get("title", "").lower()
-                    or q_lower in " ".join(e.get("files_touched", [])).lower()
-                    or q_lower in e.get("blockers", "").lower()
-                    or q_lower in e.get("next_up", "").lower()
-                    or q_lower in e.get("notes", "").lower()
-                ]
-                return JSONResponse(results)
-
-            @app.get("/api/setup-status")
-            async def api_setup_status():
-                for cp in [
-                    pathlib.Path.home() / ".codeium" / "windsurf" / "mcp_settings.json",
-                    pathlib.Path.home() / "Library" / "Application Support" / "Code" / "User" / "mcp.json",
-                    pathlib.Path.home() / ".config" / "Code" / "User" / "mcp.json",
-                    pathlib.Path.home() / ".config" / "opencode" / "config.json",
-                ]:
-                    if cp.exists():
-                        try:
-                            data = json.loads(cp.read_text())
-                            if "pod-sync" in data.get("mcpServers", {}):
-                                return JSONResponse({"setup_complete": True})
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-                return JSONResponse({"setup_complete": False})
-
-            uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="error")
-        except OSError:
-            pass
-        except Exception as e:
-            print(f"[http-bg] warning: {e}", file=sys.stderr)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
-
-# ---------------------------------------------------------------------------
-# MCP server (--stdio mode)
-# ---------------------------------------------------------------------------
-
-def run_stdio():
-    """Start the MCP server in stdio mode."""
-    from mcp.server.fastmcp import FastMCP
-
-    _start_http_background()
-
-    mcp = FastMCP("pod-sync")
-
-    @mcp.tool()
-    def log_status(
-        summary: str,
-        repo_path: str,
-        files_touched: list[str] = [],
-        blockers: str = "None",
-        next_up: str = "",
-    ) -> str:
-        """
-        Log your end-of-day status entry to the project repo's logging branch.
-        Author is auto-detected from git config — never ask the user for their name.
-        repo_path: absolute path to the project repo the user is working in.
-        summary: 2-4 sentences, past tense, specific. Synthesize from conversation context.
-        files_touched: list of file paths modified today. Can be empty list.
-        blockers: anything blocking progress, or 'None'.
-        next_up: what you are picking up tomorrow. Specific enough a teammate could continue it.
-        """
-        return tool_log_status(summary, repo_path, files_touched, blockers, next_up)
-
-    @mcp.tool()
-    def read_status(
-        repo_path: str,
-        who: str = "all",
-        when: str = "latest",
-        query: str = "",
-    ) -> str:
-        """
-        Read status and OpenSpec entries from a project repo's logging branch.
-        repo_path: absolute path to the project repo to read from.
-        who: 'all' or a partial name match (case-insensitive).
-        when: 'latest', 'today', 'yesterday', 'this week', 'last week',
-              or an ISO date 'YYYY-MM-DD', or a range 'YYYY-MM-DD:YYYY-MM-DD'.
-        query: optional keyword filter applied after date/author filtering.
-        Always git pulls before reading to ensure fresh data.
-        """
-        return tool_read_status(repo_path, who, when, query)
-
-    @mcp.tool()
-    def log_openspec_event(
-        title: str,
-        repo: str,
-        repo_path: str,
-        event_type: str = "proposal_created",
-        openspec_path: str = "openspec/changes/",
-        notes: str = "",
-    ) -> str:
-        """
-        Called after an OpenSpec proposal is created or updated in a project repo.
-        Commits the proposal and logs the event to entries.json on the logging branch.
-
-        title: human-readable proposal title e.g. "Alert Engine Rate Limiting"
-        repo: repo name e.g. "dashboard-repo"
-        repo_path: absolute path to the project repo on this machine
-        event_type: "proposal_created", "proposal_updated", "proposal_archived"
-        openspec_path: path within repo to the OpenSpec change folder
-        notes: optional one-line note about the proposal
-        """
-        return tool_log_openspec_event(title, repo, repo_path, event_type, openspec_path, notes)
-
-    @mcp.tool()
-    def read_presence(repo_path: str) -> str:
-        """
-        Show who on the team is currently active in a specific project repo.
-        Reads heartbeat/presence.json from the repo's logging branch.
-        Active = last_seen within 30 minutes.
-        repo_path: absolute path to the project repo to check.
-        Always git pulls before reading.
-        """
-        return tool_read_presence(repo_path)
-
-    mcp.run(transport="stdio")
-
-# ---------------------------------------------------------------------------
-# HTTP server (--http mode)
-# ---------------------------------------------------------------------------
-
-def run_http():
-    """Start the FastAPI HTTP server for the web UI."""
+def build_app(include_setup=True):
     from fastapi import FastAPI, Request
     from fastapi.responses import HTMLResponse, JSONResponse
-    import uvicorn
 
     app = FastAPI(title="Pod-Sync")
+
+    @app.middleware("http")
+    async def _localhost_only(request, call_next):
+        # Blocks DNS-rebinding style access; the server itself binds 127.0.0.1.
+        host = (request.headers.get("host") or "").split(":")[0]
+        if host not in ("localhost", "127.0.0.1", "[::1]", ""):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        return await call_next(request)
+
+    def _registered(path: str):
+        """Resolve a client-supplied path against registered repos. The API
+        never runs git in a directory Pod-Sync wasn't told about."""
+        if not path:
+            return None
+        try:
+            resolved = str(pathlib.Path(path).resolve())
+        except OSError:
+            return None
+        known = {str(pathlib.Path(p).resolve()) for p in load_config().get("registered_repos", [])}
+        return resolved if resolved in known else None
 
     @app.get("/", response_class=HTMLResponse)
     async def serve_ui():
         if WEB_UI_PATH.exists():
             return HTMLResponse(WEB_UI_PATH.read_text())
         return HTMLResponse("<h1>Pod-Sync</h1><p>web-ui/index.html not found.</p>")
-
-    # --- Repo-scoped data endpoints ---
 
     @app.get("/api/repos")
     async def api_repos():
@@ -1141,21 +1040,26 @@ def run_http():
 
     @app.get("/api/repo/entries")
     async def api_repo_entries(path: str = ""):
-        if not path:
-            return JSONResponse([])
-        return JSONResponse(_read_repo_entries(path))
+        rp = _registered(path)
+        if rp is None:
+            return JSONResponse({"error": "unknown repo"}, status_code=404)
+        return JSONResponse(load_repo_entries(rp))
 
     @app.get("/api/repo/presence")
     async def api_repo_presence(path: str = ""):
-        if not path:
-            return JSONResponse({})
-        return JSONResponse(_read_repo_presence(path))
+        rp = _registered(path)
+        if rp is None:
+            return JSONResponse({"error": "unknown repo"}, status_code=404)
+        return JSONResponse(load_repo_presence(rp))
 
     @app.get("/api/repo/search")
     async def api_repo_search(path: str = "", q: str = ""):
-        if not path or not q:
+        rp = _registered(path)
+        if rp is None:
+            return JSONResponse({"error": "unknown repo"}, status_code=404)
+        if not q:
             return JSONResponse([])
-        entries = _read_repo_entries(path)
+        entries = load_repo_entries(rp)
         q_lower = q.lower()
         results = [
             e for e in entries
@@ -1168,7 +1072,27 @@ def run_http():
         ]
         return JSONResponse(results)
 
-    # --- Setup endpoints (unchanged) ---
+    @app.get("/api/setup-status")
+    async def api_setup_status():
+        for cp in [
+            pathlib.Path.home() / ".codeium" / "windsurf" / "mcp_settings.json",
+            pathlib.Path.home() / "Library" / "Application Support" / "Code" / "User" / "mcp.json",
+            pathlib.Path.home() / ".config" / "Code" / "User" / "mcp.json",
+            pathlib.Path.home() / ".config" / "opencode" / "config.json",
+        ]:
+            if cp.exists():
+                try:
+                    data = json.loads(cp.read_text())
+                    if "pod-sync" in data.get("mcpServers", {}):
+                        return JSONResponse({"setup_complete": True})
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        return JSONResponse({"setup_complete": False})
+
+    if not include_setup:
+        return app
+
+    # --- Setup endpoints (wizard only) ---
 
     @app.get("/api/detect-ides")
     async def api_detect_ides():
@@ -1180,10 +1104,15 @@ def run_http():
     @app.post("/api/test-ssh")
     async def api_test_ssh():
         host = _get_git_host()
-        result = subprocess.run(
-            ["ssh", "-T", f"git@{host}"],
-            capture_output=True, text=True, timeout=10
-        )
+        try:
+            result = subprocess.run(
+                ["ssh", "-T", f"git@{host}"],
+                capture_output=True, text=True, timeout=10
+            )
+        except subprocess.TimeoutExpired:
+            return JSONResponse({"success": False, "message": "SSH test timed out after 10s."})
+        except FileNotFoundError:
+            return JSONResponse({"success": False, "message": "ssh command not found on this machine."})
         output = result.stderr + result.stdout
         success = "successfully authenticated" in output.lower()
         return JSONResponse({"success": success, "message": output.strip()})
@@ -1291,23 +1220,130 @@ def run_http():
             return JSONResponse({"success": False, "errors": errors})
         return JSONResponse({"success": True, "ide": ide, "message": "Setup complete."})
 
-    @app.get("/api/setup-status")
-    async def api_setup_status():
-        for cp in [
-            pathlib.Path.home() / ".codeium" / "windsurf" / "mcp_settings.json",
-            pathlib.Path.home() / "Library" / "Application Support" / "Code" / "User" / "mcp.json",
-            pathlib.Path.home() / ".config" / "Code" / "User" / "mcp.json",
-            pathlib.Path.home() / ".config" / "opencode" / "config.json",
-        ]:
-            if cp.exists():
-                try:
-                    data = json.loads(cp.read_text())
-                    if "pod-sync" in data.get("mcpServers", {}):
-                        return JSONResponse({"setup_complete": True})
-                except (json.JSONDecodeError, KeyError):
-                    continue
-        return JSONResponse({"setup_complete": False})
+    return app
 
+# ---------------------------------------------------------------------------
+# Background HTTP dashboard (spawned as daemon thread in stdio mode)
+# ---------------------------------------------------------------------------
+
+def _start_http_background():
+    """Spawn the HTTP dashboard in a daemon thread (used during stdio mode)."""
+    def _run():
+        try:
+            import uvicorn
+            app = build_app(include_setup=False)
+            uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="error")
+        except OSError:
+            pass  # another Pod-Sync process already serves the dashboard
+        except Exception as e:
+            print(f"[http-bg] warning: {e}", file=sys.stderr)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+# ---------------------------------------------------------------------------
+# MCP server (--stdio mode)
+# ---------------------------------------------------------------------------
+
+def run_stdio():
+    """Start the MCP server in stdio mode."""
+    from mcp.server.fastmcp import FastMCP
+
+    _start_http_background()
+
+    mcp = FastMCP("pod-sync")
+
+    @mcp.tool()
+    def log_status(
+        summary: str,
+        repo_path: str,
+        files_touched: list[str] = [],
+        blockers: str = "None",
+        next_up: str = "",
+        mode: str = "new",
+    ) -> str:
+        """
+        Log your end-of-day status entry to the project repo's logging branch.
+        Author is auto-detected from git config — never ask the user for their name.
+        Never touches the user's working tree (writes happen in a hidden worktree).
+        repo_path: absolute path to the project repo the user is working in.
+        summary: 2-4 sentences, past tense, specific. Synthesize from conversation context.
+        files_touched: list of file paths modified today. Can be empty list.
+        blockers: anything blocking progress, or 'None'.
+        next_up: what you are picking up tomorrow. Specific enough a teammate could continue it.
+        mode: 'new' (default), 'update' (append a mid-day update for today),
+              or 'replace' (replace today's existing entry).
+        """
+        return tool_log_status(summary, repo_path, files_touched, blockers, next_up, mode)
+
+    @mcp.tool()
+    def read_status(
+        repo_path: str,
+        who: str = "all",
+        when: str = "latest",
+        query: str = "",
+    ) -> str:
+        """
+        Read status and OpenSpec entries from a project repo's logging branch.
+        repo_path: absolute path to the project repo to read from.
+        who: 'all' or a partial name match (case-insensitive).
+        when: 'latest', 'today', 'yesterday', 'this week', 'last week',
+              or an ISO date 'YYYY-MM-DD', or a range 'YYYY-MM-DD:YYYY-MM-DD'.
+        query: optional keyword filter applied after date/author filtering.
+        Always syncs with origin before reading; never touches the user's working tree.
+        """
+        return tool_read_status(repo_path, who, when, query)
+
+    @mcp.tool()
+    def log_openspec_event(
+        title: str,
+        repo: str,
+        repo_path: str,
+        event_type: str = "proposal_created",
+        openspec_path: str = "openspec/changes/",
+        notes: str = "",
+        proposal_files: Optional[dict[str, str]] = None,
+    ) -> str:
+        """
+        Called when an OpenSpec proposal is created or updated in a project repo.
+        Writes the proposal files and the event record to the logging branch in
+        a single commit. Never touches the user's working tree.
+
+        title: human-readable proposal title e.g. "Alert Engine Rate Limiting"
+        repo: repo name e.g. "dashboard-repo"
+        repo_path: absolute path to the project repo on this machine
+        event_type: "proposal_created", "proposal_updated", "proposal_archived"
+        openspec_path: path within repo to the OpenSpec change folder
+        notes: optional one-line note about the proposal
+        proposal_files: mapping of repo-relative file path → full file content,
+                        e.g. {"openspec/changes/rate-limit/proposal.md": "# ..."}.
+                        Required for proposal_created/proposal_updated — this is
+                        how the proposal document reaches the logging branch.
+        """
+        return tool_log_openspec_event(title, repo, repo_path, event_type, openspec_path, notes, proposal_files)
+
+    @mcp.tool()
+    def read_presence(repo_path: str) -> str:
+        """
+        Show who on the team is recently active in a specific project repo.
+        Presence is derived from commit activity on origin (last push per
+        author across all branches). Active = pushed within 30 minutes.
+        repo_path: absolute path to the project repo to check.
+        Read-only; never touches the user's working tree.
+        """
+        return tool_read_presence(repo_path)
+
+    mcp.run(transport="stdio")
+
+# ---------------------------------------------------------------------------
+# HTTP server (--http mode)
+# ---------------------------------------------------------------------------
+
+def run_http():
+    """Start the FastAPI HTTP server for the web UI."""
+    import uvicorn
+
+    app = build_app(include_setup=True)
     print(f"Pod-Sync server starting on http://localhost:{PORT}")
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
 

@@ -37,24 +37,46 @@ your IDE agent
   → reads Pod-Sync skill (understands the protocol)
   → calls MCP tool (log_status / read_status / log_openspec_event / read_presence)
   → server.py runs locally on your machine
-  → git push/pull syncs with teammates via shared Pod-Sync repo
+  → git push/pull syncs with teammates via each project repo's logging branch
 ```
 
 ## The logging branch standard
 
-Every project repo you work in gets a `logging` branch. OpenSpec proposals
-live there. It never gets merged into main. Pod-Sync enforces this automatically.
+Every project repo you work in gets a `logging` branch — an orphan branch that
+contains only coordination data, never project code. Status entries and
+OpenSpec proposals live there. It never gets merged into main. Pod-Sync
+enforces this automatically.
+
+All Pod-Sync git work happens in a hidden worktree
+(`~/.local/share/pod-sync/worktrees/`). Your checkout, your branch, and your
+uncommitted changes are never touched.
 
 ## Data
 
-- Status entries and OpenSpec events → `team-status/entries.json`
-- Older than 90 days → `team-status/archive/YYYY-W##.json`
+All data lives on each project repo's `logging` branch:
+
+- Status entries and OpenSpec events → `entries/<author>.jsonl` (one file per
+  author, so teammates never hit git merge conflicts)
+- Older than 90 days → `archive/<author>-YYYY-W##.jsonl`
+- OpenSpec proposal documents → `openspec/changes/...`
 - Nothing is ever deleted. Archive is fully searchable.
+
+Presence ("who's active right now?") is derived from recent commit activity
+on origin — no heartbeat files, no background commit noise.
 
 ## Auth
 
 Uses your existing git credentials — SSH key or PAT — stored in your OS
 keychain. Setup handles this. Nothing is stored in this repo.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests run against real git repos in a temp directory — no network needed.
 
 ## Built by
 
