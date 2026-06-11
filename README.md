@@ -16,19 +16,19 @@ A browser window opens. Pick your IDE. Authenticate once. Done.
 
 ## Usage
 
-From any project in your IDE:
+Pod-Sync works through skills — structured instruction files that teach your IDE agent the full protocol. After install, run this once from any project repo:
 
-```
-"log my status for today"
-"catch me up on the team"
-"what did Naresh work on yesterday?"
-"any blockers on the team?"
-"who's active right now?"
-"create an openspec proposal for rate limiting"
-"any openspec proposals this week?"
+```bash
+pod-sync install-skills
 ```
 
-Or open the dashboard: **http://localhost:7823**
+This drops three skills into your IDE's global skills directory. Once installed, open your IDE and invoke them directly from the Skills panel:
+
+- **pod-sync-update** — log your end-of-day status. The agent collects context from git automatically, shows you a draft, and pushes after you confirm.
+- **pod-sync-read** — read what the team did. Ask for a specific person, a date range, or just catch me up on everyone.
+- **pod-sync-openspec** — create or update an OpenSpec proposal. The agent commits it to the logging branch of your current repo and surfaces it in the team dashboard.
+
+Or open the dashboard directly: **http://localhost:7823**
 
 ## How it works
 
