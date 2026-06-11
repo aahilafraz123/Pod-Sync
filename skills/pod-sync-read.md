@@ -30,11 +30,11 @@ ALLOWED:
   - Mention the web dashboard at localhost:7823 for richer viewing
 
 FORBIDDEN — NEVER DO ANY OF THESE:
-  - Writing to entries.json or any file
+  - Writing to any entry file or any file at all
   - Running git commit, git push, git add
   - Calling log_status() or log_openspec_event()
   - Modifying, creating, or deleting any file on disk
-  - Directly reading entries.json from the filesystem (use the MCP tool)
+  - Directly reading entry files (entries/*.jsonl) from the filesystem (use the MCP tool)
 ```
 
 If the user's request crosses this boundary, name the correct skill and stop.
@@ -44,7 +44,7 @@ If the user's request crosses this boundary, name the correct skill and stop.
 ## HARD RULES
 
 1. **This skill is strictly READ ONLY.** No writes. No commits. No pushes. No file creation. No file modification. No exceptions.
-2. **All reads go through the MCP tools.** Call `read_status()` or `read_presence()`. Do not read `entries.json` directly from disk. The MCP tool handles git pull to ensure fresh data.
+2. **All reads go through the MCP tools.** Call `read_status()` or `read_presence()`. Do not read entry files directly from disk. The MCP tool syncs with origin to ensure fresh data.
 3. **Never fabricate entries.** If no data exists for a query, say so plainly. Do not generate plausible-sounding status entries.
 4. **Never switch to writing.** If the user says "actually, log my status" mid-conversation, tell them that requires `pod-sync-update` and stop. Do not cross the boundary.
 5. **Two tools, two purposes.** `read_status()` is for entries (status logs and openspec events). `read_presence()` is for who is online right now. Do not use one when you need the other.
@@ -102,17 +102,14 @@ This returns the most recent entry per author, both types.
 
 ## Repo context — collect this silently before calling any tool
 
-Before calling any MCP tool, run these git commands in the current workspace
-and use the output to populate the call. Never ask the user for any of this.
+Pass `repo_path` as the absolute path to the current workspace root. Determine
+it from the workspace — never ask the user for it unless the workspace is
+genuinely ambiguous. If you need to confirm which repo you are in,
+`git remote get-url origin` is the only read-only command you need.
 
-1. `git remote get-url origin`     → determines which repo this is
-2. `git branch --show-current`     → current branch (for context only, not logged)
-3. `git log --since="midnight" --oneline`  → today's commits, use to help write summary
-4. `git diff --name-status HEAD`   → files touched today, use for files_touched param
-
-Pass `repo_path` as the absolute path to the current workspace root.
-The MCP tool handles branch switching, reading, writing, and pushing.
-Never switch branches manually. Never write to entries.json directly.
+The MCP tools read from the repo's `logging` branch through a hidden Pod-Sync
+worktree — they never switch branches or touch the user's working tree, and
+neither should you.
 
 ---
 
@@ -132,8 +129,9 @@ read_status(
 ```
 
 The tool handles:
-- `git pull --rebase` before reading (data is always fresh)
-- Loading from `entries.json` (current 90-day window)
+- Syncing the logging branch from origin before reading (data is always fresh;
+  if origin is unreachable it returns last known data with a warning)
+- Loading every author's entry file (`entries/<author>.jsonl`, current 90-day window)
 - Loading from archive files if the date range extends beyond 90 days
 - Filtering by author, date, and keyword
 - Returning both `status` and `openspec_proposal` entry types
@@ -147,10 +145,14 @@ read_presence(
 ```
 
 The tool handles:
-- `git pull --rebase` before reading
-- Reading `heartbeat/presence.json`
-- Classifying each teammate as active (seen within 30 min) or away
-- Returning formatted presence list
+- Fetching the latest refs from origin (read-only — never touches the working tree)
+- Deriving presence from recent commit activity (last push per author, all branches)
+- Classifying each teammate as active (pushed within 30 min) or away
+- Returning a formatted presence list
+
+There is no heartbeat file — presence reflects who has actually pushed
+commits recently, which in an AI-native pod (agents commit frequently)
+tracks real activity closely.
 
 ---
 
@@ -245,7 +247,7 @@ These are explicit exclusions. If you find yourself doing any of these, you have
 
 - Log a status entry (use `pod-sync-update`)
 - Create, update, or archive an OpenSpec proposal (use `pod-sync-openspec`)
-- Write to `entries.json` or any other file
+- Write to any entry file or any other file
 - Run `git commit`, `git push`, `git add`
 - Modify the filesystem in any way
-- Read `entries.json` directly from disk (always use the MCP tool)
+- Read entry files directly from disk (always use the MCP tool)

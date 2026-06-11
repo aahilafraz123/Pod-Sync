@@ -261,6 +261,12 @@ let selectedAuth = null;
 let authVerified = false;
 let currentRepoPath = null;
 let currentRepoEntries = [];
+let refreshTimer = null;
+
+function setRefresh(fn) {
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(fn, 60000);
+}
 
 // ---------------------------------------------------------------------------
 // Init
@@ -276,6 +282,7 @@ async function init() {
 }
 
 function showSetup() {
+  clearInterval(refreshTimer);
   document.getElementById('setup').style.display = 'block';
   document.getElementById('home').style.display = 'none';
   document.getElementById('repo-view').style.display = 'none';
@@ -287,6 +294,7 @@ function showHome() {
   document.getElementById('home').style.display = 'block';
   document.getElementById('repo-view').style.display = 'none';
   loadRepos();
+  setRefresh(loadRepos);
 }
 
 function showRepoView(path, name) {
@@ -297,6 +305,13 @@ function showRepoView(path, name) {
   document.getElementById('repo-view-name').textContent = name;
   document.getElementById('repo-search-input').value = '';
   loadRepoData(path);
+  setRefresh(() => {
+    loadRepoPresence(currentRepoPath);
+    // Don't clobber active search results with the full feed.
+    if (!document.getElementById('repo-search-input').value.trim()) {
+      loadRepoEntries(currentRepoPath);
+    }
+  });
 }
 
 function goHome() {
@@ -404,12 +419,16 @@ async function loadRepos() {
   const grid = document.getElementById('repo-grid');
   try {
     const res = await fetch('/api/repos');
+    if (!res.ok) throw new Error('bad response');
     const repos = await res.json();
     if (!repos.length) {
       grid.innerHTML = '<div class="empty-home"><h3>No repos registered yet</h3><p>Log your first status from any project repo in your IDE.<br>Repos appear here automatically.</p></div>';
       return;
     }
     grid.innerHTML = repos.map(r => renderRepoCard(r)).join('');
+    grid.querySelectorAll('.repo-card').forEach(card => {
+      card.addEventListener('click', () => showRepoView(card.dataset.path, card.dataset.name));
+    });
   } catch (e) {
     grid.innerHTML = '<div class="empty-home"><h3>Cannot load repos</h3><p>Is the server running?</p></div>';
   }
@@ -419,7 +438,7 @@ function renderRepoCard(r) {
   const lastLog = r.last_log_timestamp ? timeAgo(r.last_log_timestamp) : 'no logs yet';
   const membersHtml = (r.members || []).map(m => `<span class="member-chip">${esc(m)}</span>`).join('');
   return `
-    <div class="repo-card" onclick="showRepoView('${esc(r.path)}', '${esc(r.name)}')">
+    <div class="repo-card" data-path="${escAttr(r.path)}" data-name="${escAttr(r.name)}">
       <div class="repo-card-name">${esc(r.name)}</div>
       <div class="repo-card-stats">
         <div class="repo-card-stat"><span class="dot active"></span>${r.active_count} active</div>
@@ -441,6 +460,7 @@ async function loadRepoData(path) {
 async function loadRepoEntries(path) {
   try {
     const res = await fetch('/api/repo/entries?path=' + encodeURIComponent(path));
+    if (!res.ok) throw new Error('bad response');
     currentRepoEntries = await res.json();
     renderRepoFeed(currentRepoEntries);
   } catch (e) {
@@ -451,6 +471,7 @@ async function loadRepoEntries(path) {
 async function loadRepoPresence(path) {
   try {
     const res = await fetch('/api/repo/presence?path=' + encodeURIComponent(path));
+    if (!res.ok) throw new Error('bad response');
     const presence = await res.json();
     renderRepoPresence(presence);
   } catch (e) {}
@@ -545,6 +566,7 @@ document.addEventListener('DOMContentLoaded', () => {
       repoSearchTimeout = setTimeout(async () => {
         try {
           const res = await fetch('/api/repo/search?path=' + encodeURIComponent(currentRepoPath) + '&q=' + encodeURIComponent(q));
+          if (!res.ok) throw new Error('bad response');
           const results = await res.json();
           renderRepoFeed(results);
         } catch (e) {}
@@ -557,6 +579,9 @@ document.addEventListener('DOMContentLoaded', () => {
 // Utilities
 // ---------------------------------------------------------------------------
 function esc(str) { if (!str) return ''; const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
+
+// For HTML attribute values — esc() doesn't escape quotes.
+function escAttr(str) { return esc(str).replace(/"/g, '&quot;'); }
 
 function timeAgo(ts) {
   if (!ts) return '';

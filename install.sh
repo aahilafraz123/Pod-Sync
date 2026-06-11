@@ -153,25 +153,30 @@ success "pod-sync CLI installed at $CLI_TARGET"
 # ─────────────────────────────────────────────────────────────
 info "Starting Pod-Sync setup server on localhost:7823..."
 
-# Check if port 7823 is already in use
+# Check if port 7823 is already in use — only kill it if it's actually
+# a Pod-Sync server, never an unrelated process.
+EXISTING_PID=""
 if command -v lsof &>/dev/null; then
-    EXISTING_PID=$(lsof -ti tcp:7823 2>/dev/null || true)
-    if [ -n "$EXISTING_PID" ]; then
-        warn "Port 7823 is already in use (PID $EXISTING_PID). Killing existing process..."
+    EXISTING_PID=$(lsof -ti tcp:7823 2>/dev/null | head -n1 || true)
+elif command -v ss &>/dev/null; then
+    EXISTING_PID=$(ss -tlnp 'sport = :7823' 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
+fi
+
+if [ -n "$EXISTING_PID" ]; then
+    EXISTING_CMD=$(ps -p "$EXISTING_PID" -o args= 2>/dev/null || true)
+    if echo "$EXISTING_CMD" | grep -q "server.py"; then
+        warn "A previous Pod-Sync server is running on port 7823 (PID $EXISTING_PID). Stopping it..."
         kill "$EXISTING_PID" 2>/dev/null || true
         sleep 1
-        # Force kill if still running
         if kill -0 "$EXISTING_PID" 2>/dev/null; then
             kill -9 "$EXISTING_PID" 2>/dev/null || true
         fi
         success "Cleared port 7823."
-    fi
-elif command -v ss &>/dev/null; then
-    EXISTING_PID=$(ss -tlnp 'sport = :7823' 2>/dev/null | grep -oP 'pid=\K[0-9]+' || true)
-    if [ -n "$EXISTING_PID" ]; then
-        warn "Port 7823 is already in use (PID $EXISTING_PID). Killing existing process..."
-        kill "$EXISTING_PID" 2>/dev/null || true
-        sleep 1
+    else
+        error "Port 7823 is in use by another process (PID $EXISTING_PID):"
+        echo "    $EXISTING_CMD"
+        error "Stop that process and re-run ./install.sh."
+        exit 1
     fi
 fi
 

@@ -4,16 +4,15 @@ description: "Use this skill when a teammate creates, updates, or archives an Op
 proposal. Triggers: '/opsx:new', '/opsx:continue', '/opsx:archive', 'create a spec
 proposal', 'update the proposal', 'archive the spec'. Do NOT use for status logging —
 that is pod-sync-update. Do NOT use for reading — that is pod-sync-read. THIS
-SKILL WRITES. It calls the log_openspec_event() MCP tool which performs a dual-write:
-committing the proposal to a project repo's logging branch and logging an event to
-Pod-Sync's entries.json."
+SKILL WRITES. It calls the log_openspec_event() MCP tool which commits the proposal
+files AND the event record to the project repo's logging branch in one commit."
 ---
 
 # Pod-Sync — OpenSpec Skill
 
 > **THIS IS A WRITE-ONLY SKILL.**
-> It calls `log_openspec_event()` to commit proposal files to a project repo's `logging`
-> branch and log the event to Pod-Sync's `entries.json`.
+> It calls `log_openspec_event()` to commit proposal files and the event record
+> to the project repo's `logging` branch in a single commit.
 > It does not read entries. It does not summarize. It does not query.
 > If the user wants to READ the log or view proposals, STOP — use `pod-sync-read`.
 > If the user wants to LOG a daily status update, STOP — use `pod-sync-update`.
@@ -24,15 +23,17 @@ Pod-Sync's entries.json."
 
 ```
 ALLOWED:
-  - Call log_openspec_event() MCP tool
+  - Call log_openspec_event() MCP tool — passing the proposal content via
+    its proposal_files parameter
   - Help the user draft proposal content in conversation
   - Present a confirmation preview before calling the tool
   - Determine repo_path from the current workspace root
 
 FORBIDDEN — NEVER DO ANY OF THESE:
-  - Writing files to disk directly (the MCP tool handles all file writes)
+  - Writing files to disk directly (proposal content goes through the
+    proposal_files parameter; the MCP tool writes it on the logging branch)
   - Running git commit, git push, git add, git checkout, git stash (the MCP tool handles all git operations)
-  - Reading entries.json to display past entries (that is pod-sync-read)
+  - Reading entry files to display past entries (that is pod-sync-read)
   - Calling log_status() (that is pod-sync-update)
   - Calling read_status() or read_presence() (that is pod-sync-read)
   - Modifying any file on the filesystem outside of the MCP tool's scope
@@ -44,8 +45,10 @@ If the user's request crosses this boundary, name the correct skill and stop.
 
 ## Execution Model — Two Layers
 
-- **This file** defines the protocol: how to gather proposal info, confirm with the user, and call the tool.
-- **The MCP tool** handles execution: `log_openspec_event()` does the dual-write (project repo `logging` branch + Pod-Sync `entries.json`).
+- **This file** defines the protocol: how to draft the proposal, confirm with the user, and call the tool.
+- **The MCP tool** handles execution: `log_openspec_event()` writes the proposal
+  files and the event record to the project repo's `logging` branch in one commit,
+  through a hidden Pod-Sync worktree that never touches the user's checkout.
 
 Never write to disk or run git directly. Always call `log_openspec_event()`.
 
@@ -53,8 +56,8 @@ Never write to disk or run git directly. Always call `log_openspec_event()`.
 
 ## HARD RULES
 
-1. **Never write to disk directly.** All writes — proposal files, git commits, pushes, entries.json — go through `log_openspec_event()`. You call the tool. That is all.
-2. **Never run git commands that modify state.** No `git commit`, `git push`, `git add`, `git checkout`, `git stash`. The MCP tool handles every git operation, including branch switching, stashing, committing, and pushing.
+1. **Never write to disk directly.** All writes — proposal files, git commits, pushes, the event record — go through `log_openspec_event()`. Proposal content is passed in the `proposal_files` parameter. You call the tool. That is all.
+2. **Never run git commands that modify state.** No `git commit`, `git push`, `git add`, `git checkout`, `git stash`. The MCP tool handles every git operation in its own hidden worktree.
 3. **Never read entries to display them.** If the user asks "show me the proposals" mid-conversation, tell them to use `pod-sync-read`. Do not switch roles.
 4. **Never invent proposal content.** If the user has not provided or confirmed the content, do not fabricate it. Ask.
 5. **Confirm before calling the tool.** Show the user exactly what will be sent to `log_openspec_event()`. Wait for explicit approval.
@@ -104,23 +107,22 @@ For **`/opsx:new`**: Help draft the full proposal document from scratch.
 For **`/opsx:continue`**: Discuss what needs to change and help revise the document.
 For **`/opsx:archive`**: Confirm which proposal to archive and whether a final note is needed.
 
-Do not write the proposal to disk yourself. The MCP tool does that.
+Do not write the proposal to disk yourself. Hold the finished content in the
+conversation and pass it to the tool via `proposal_files` in Phase 4 — the MCP
+tool writes it on the `logging` branch.
 
 ---
 
 ## Repo context — collect this silently before calling any tool
 
-Before calling any MCP tool, run these git commands in the current workspace
-and use the output to populate the call. Never ask the user for any of this.
+Determine these from the current workspace. Never ask the user for any of this.
 
-1. `git remote get-url origin`     → determines which repo this is
-2. `git branch --show-current`     → current branch (for context only, not logged)
-3. `git log --since="midnight" --oneline`  → today's commits, use to help write summary
-4. `git diff --name-status HEAD`   → files touched today, use for files_touched param
+1. `git remote get-url origin`     → determines which repo this is (the `repo` parameter)
+2. The workspace root's absolute path → the `repo_path` parameter
 
-Pass `repo_path` as the absolute path to the current workspace root.
-The MCP tool handles branch switching, reading, writing, and pushing.
-Never switch branches manually. Never write to entries.json directly.
+The MCP tool does all reading, writing, and pushing through a hidden Pod-Sync
+worktree — it never switches branches or touches the user's working tree.
+Never switch branches manually. Never write proposal or entry files directly.
 
 ---
 
@@ -139,6 +141,7 @@ Never switch branches manually. Never write to entries.json directly.
 | `event_type` | One of: `"proposal_created"`, `"proposal_updated"`, `"proposal_archived"`. Determined by the trigger command. |
 | `openspec_path` | Relative path within the repo: `"openspec/changes/[folder-name]/"`. |
 | `notes` | Optional one-line summary. Can be empty. |
+| `proposal_files` | Mapping of repo-relative file path → full file content, e.g. `{"openspec/changes/[folder-name]/proposal.md": "..."}`. Required for `proposal_created` and `proposal_updated` — this is how the document reaches the `logging` branch. |
 
 ### What `repo_path` Means
 
@@ -175,13 +178,14 @@ Here's what I'll send to log_openspec_event():
   Repo:           [repo name]
   Repo path:      [absolute path]
   OpenSpec path:  openspec/changes/[folder-name]/
+  Files:          [list the proposal_files paths]
   Notes:          [one-line summary, or "none"]
 
 The tool will:
-  - Switch to the logging branch in [repo name]
-  - Commit and push the proposal there
-  - Log the event to Pod-Sync entries.json
-  - Push to Pod-Sync repo
+  - Write the proposal files on [repo name]'s logging branch
+  - Record the event in your entry file (entries/<author>.jsonl) on the same branch
+  - Commit both together and push to origin/logging
+  - Your working tree is never touched
 
 Say "go" to submit, or correct anything above.
 ```
@@ -205,18 +209,21 @@ log_openspec_event(
     repo_path="[absolute path]",
     event_type="[proposal_created | proposal_updated | proposal_archived]",
     openspec_path="openspec/changes/[folder-name]/",
-    notes="[one-line summary or empty]"
+    notes="[one-line summary or empty]",
+    proposal_files={
+        "openspec/changes/[folder-name]/proposal.md": "[full document content]"
+    }
 )
 ```
 
 The MCP tool handles everything from here:
-- Stashes any uncommitted changes in the project repo if needed
-- Switches to the `logging` branch (creates it if it does not exist)
-- Writes and commits the proposal files on the `logging` branch
-- Pushes to the project repo's remote
-- Switches back to the original branch and unstashes
-- Writes the event to Pod-Sync's `entries.json`
-- Commits and pushes to the Pod-Sync repo
+- Syncs the `logging` branch from origin in a hidden Pod-Sync worktree
+  (creates the branch if it does not exist — as an orphan, so it never
+  contains project code)
+- Writes the proposal files on the `logging` branch
+- Appends the event to your entry file (`entries/<author>.jsonl`)
+- Commits both together and pushes to the project repo's `logging` branch
+- The user's working tree, branch, and uncommitted changes are never touched
 
 **You do not run git add, git commit, git push, git checkout, or git stash. The tool does.**
 
@@ -230,8 +237,8 @@ If the tool returns success, confirm to the user:
 
 ```
 OpenSpec [event_type] logged.
-  Proposal committed to [repo]/logging branch.
-  Event recorded in Pod-Sync entries.json.
+  Proposal and event committed to [repo]/logging branch.
+  Visible in the team dashboard.
 ```
 
 If the tool returns an error, handle it:
@@ -239,7 +246,7 @@ If the tool returns an error, handle it:
 | Error | Action |
 |-------|--------|
 | Auth/SSH/SSO error | Tell the user to re-authorize. Link: https://github.com/settings/ssh |
-| Push to logging branch failed | Surface the error clearly. Do not write to Pod-Sync entries.json — the tool ensures the project repo write succeeds first. |
+| Push to logging branch failed | The proposal and event are saved locally on the logging branch; surface the error so the user can fix connectivity/auth — the next successful write will push them. |
 | Merge conflict on logging branch | Surface the error. The user may need to resolve manually. |
 | Any other error | Surface the tool's error message verbatim. Do not retry without user input. |
 
@@ -249,11 +256,11 @@ If the tool returns an error, handle it:
 
 | Situation | Action |
 |-----------|--------|
-| `logging` branch does not exist | The MCP tool creates it automatically. No action needed from you. |
-| Uncommitted changes in project repo | The MCP tool stashes before switching, unstashes after. No action needed from you. |
-| User is already on `logging` branch | The tool proceeds normally — no branch switch needed. |
-| Push to logging branch fails | Report the error clearly. The tool will NOT write to Pod-Sync entries.json if the project repo write fails. |
-| User asks to see existing proposals | That is a READ operation. Tell them to use `pod-sync-read`. Do not read entries.json or the filesystem yourself. |
+| `logging` branch does not exist | The MCP tool creates it automatically (as an orphan branch with no project code). No action needed from you. |
+| Uncommitted changes in project repo | Irrelevant — the tool works in its own hidden worktree and never touches the user's checkout. |
+| User is already on `logging` branch | The tool operates in that checkout directly — no branch switch needed. |
+| Push to logging branch fails | Report the error clearly. The proposal and event are committed locally and will be pushed on the next successful write. |
+| User asks to see existing proposals | That is a READ operation. Tell them to use `pod-sync-read`. Do not read entry files or the filesystem yourself. |
 | User asks to log a daily status | That is a STATUS operation. Tell them to use `pod-sync-update`. Do not call `log_status()`. |
 | User says "just archive it" with no context | Ask which proposal to archive. Do not guess. |
 | `repo_path` cannot be determined | Ask the user for the absolute path to their project repo. Do not fabricate a path. |
@@ -268,7 +275,7 @@ These are explicit exclusions. If you find yourself doing any of these, you are 
 - Summarize what the team did (use `pod-sync-read`)
 - Check who is active / online (use `pod-sync-read` with `read_presence()`)
 - Log a daily status update (use `pod-sync-update`)
-- Write directly to `entries.json` or any file on disk
-- Write proposal files to the filesystem directly
+- Write directly to any entry file or any file on disk
+- Write proposal files to the filesystem directly (pass content via `proposal_files`)
 - Run `git commit`, `git push`, `git add`, `git checkout`, `git stash`, or any git write command
 - Modify the filesystem in any way outside of calling `log_openspec_event()`
