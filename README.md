@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-git clone git@github.com:YOUR_ORG/pod-sync.git ~/tools/pod-sync
+git clone git@github.com:aahilafraz123/Pod-Sync.git ~/tools/pod-sync
 cd ~/tools/pod-sync
 ./install.sh
 ```
@@ -58,5 +58,4 @@ keychain. Setup handles this. Nothing is stored in this repo.
 
 ## Built by
 
-Aahil + Naresh, DevX Protect @ Comcast.
-Part of the AI Native Pod workflow.
+Aahil Afraz — AI-native developer tooling.
