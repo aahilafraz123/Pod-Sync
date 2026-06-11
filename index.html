@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pod-Sync</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+    --card-bg: #0d1117;
+    --radius: 8px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button {
+    cursor: pointer; border: 1px solid var(--border); background: var(--surface);
+    color: var(--text); padding: 8px 16px; border-radius: var(--radius); font-size: 14px;
+    transition: border-color 0.15s;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { opacity: 0.9; }
+  input[type="password"], input[type="text"] {
+    background: var(--card-bg); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: var(--radius); font-size: 14px; width: 100%; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  .container { max-width: 960px; margin: 0 auto; padding: 24px; }
+
+  /* Setup wizard styles (unchanged) */
+  #setup { display: none; }
+  .setup-header { text-align: center; margin-bottom: 32px; }
+  .setup-header h1 { font-size: 28px; margin-bottom: 4px; }
+  .setup-header p { color: var(--text-muted); }
+  .step-indicator { display: flex; justify-content: center; gap: 8px; margin-bottom: 32px; }
+  .step-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border); transition: background 0.2s; }
+  .step-dot.active { background: var(--accent); }
+  .step-dot.done { background: var(--green); }
+  .step { display: none; }
+  .step.active { display: block; }
+  .ide-cards { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+  .ide-card { width: 200px; padding: 24px; border: 2px solid var(--border); border-radius: var(--radius); text-align: center; cursor: pointer; background: var(--surface); transition: border-color 0.15s; }
+  .ide-card:hover { border-color: var(--text-muted); }
+  .ide-card.selected { border-color: var(--accent); }
+  .ide-card .icon { font-size: 36px; margin-bottom: 8px; }
+  .ide-card .label { font-weight: 600; }
+  .ide-card .detected { font-size: 12px; color: var(--green); margin-top: 4px; display: none; }
+  .ide-card.detected-ide .detected { display: block; }
+  .auth-options { display: flex; gap: 16px; margin: 16px 0; }
+  .auth-option { flex: 1; padding: 16px; border: 2px solid var(--border); border-radius: var(--radius); cursor: pointer; background: var(--surface); transition: border-color 0.15s; }
+  .auth-option:hover { border-color: var(--text-muted); }
+  .auth-option.selected { border-color: var(--accent); }
+  .auth-option h3 { font-size: 15px; margin-bottom: 4px; }
+  .auth-option p { font-size: 13px; color: var(--text-muted); }
+  .auth-panel { display: none; margin-top: 16px; }
+  .auth-panel.active { display: block; }
+  .auth-result { margin-top: 12px; padding: 12px; border-radius: var(--radius); font-size: 13px; display: none; }
+  .auth-result.success { display: block; background: #0d2818; color: var(--green); border: 1px solid #1a4028; }
+  .auth-result.error { display: block; background: #2d1013; color: var(--red); border: 1px solid #4a1c1f; }
+  .success-screen { text-align: center; padding: 40px 0; }
+  .success-screen .checkmark { font-size: 64px; margin-bottom: 16px; }
+  .success-screen h2 { margin-bottom: 8px; }
+  .success-screen .examples { text-align: left; background: var(--surface); padding: 16px; border-radius: var(--radius); margin-top: 24px; }
+  .success-screen .examples code { display: block; padding: 4px 0; color: var(--text-muted); font-size: 13px; }
+  .step-nav { margin-top: 24px; display: flex; justify-content: flex-end; gap: 8px; }
+
+  /* Level 1 — Home (repo overview) */
+  #home { display: none; }
+  .home-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  .home-header h1 { font-size: 20px; }
+  .repo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .repo-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; cursor: pointer; transition: border-color 0.15s;
+  }
+  .repo-card:hover { border-color: var(--accent); }
+  .repo-card-name { font-size: 18px; font-weight: 600; margin-bottom: 12px; }
+  .repo-card-stats { display: flex; gap: 16px; margin-bottom: 12px; font-size: 13px; color: var(--text-muted); }
+  .repo-card-stat { display: flex; align-items: center; gap: 4px; }
+  .repo-card-members { display: flex; flex-wrap: wrap; gap: 6px; }
+  .member-chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--card-bg); border: 1px solid var(--border); }
+  .member-chip.active { border-color: var(--green); color: var(--green); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .dot.active { background: var(--green); }
+  .dot.away { background: var(--text-muted); }
+  .empty-home { text-align: center; padding: 80px 20px; color: var(--text-muted); }
+  .empty-home h3 { color: var(--text); margin-bottom: 8px; }
+
+  /* Level 2 — Repo detail */
+  #repo-view { display: none; }
+  .repo-header { display: flex; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .back-btn { background: none; border: none; color: var(--accent); font-size: 16px; padding: 4px 8px; cursor: pointer; }
+  .back-btn:hover { text-decoration: underline; }
+  .repo-header h1 { font-size: 20px; }
+  .repo-header .branch-label { font-size: 13px; color: var(--text-muted); background: var(--surface); padding: 2px 8px; border-radius: var(--radius); border: 1px solid var(--border); }
+  .search-bar { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: var(--radius); font-size: 14px; width: 240px; outline: none; margin-left: auto; }
+  .search-bar:focus { border-color: var(--accent); }
+
+  .dash-body { display: flex; gap: 24px; }
+  .presence-panel {
+    width: 240px; flex-shrink: 0; background: var(--surface); border-radius: var(--radius);
+    padding: 16px; border: 1px solid var(--border); height: fit-content; position: sticky; top: 24px;
+  }
+  .presence-panel h3 { font-size: 14px; color: var(--text-muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .presence-entry { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .presence-entry:last-child { border-bottom: none; }
+  .presence-name { font-weight: 600; font-size: 14px; }
+  .presence-detail { font-size: 12px; color: var(--text-muted); }
+  .not-logged-section { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .not-logged-section h4 { font-size: 12px; color: var(--yellow); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .not-logged-name { font-size: 13px; color: var(--text-muted); padding: 2px 0; }
+
+  .feed { flex: 1; min-width: 0; }
+  .feed-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
+  .feed-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .feed-card-author { font-weight: 600; }
+  .feed-card-date { color: var(--text-muted); font-size: 13px; }
+  .feed-card-type { font-size: 11px; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  .type-status { background: #0d2818; color: var(--green); }
+  .type-openspec { background: #1a1830; color: #a371f7; }
+  .feed-card-body { font-size: 14px; }
+  .feed-card-body .field { margin-top: 8px; }
+  .feed-card-body .field-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .feed-card-body .field-value { margin-top: 2px; }
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+  .empty-state h3 { margin-bottom: 8px; color: var(--text); }
+
+  @media (max-width: 700px) {
+    .dash-body { flex-direction: column; }
+    .presence-panel { width: 100%; position: static; }
+    .ide-cards { flex-direction: column; align-items: center; }
+    .auth-options { flex-direction: column; }
+    .search-bar { width: 160px; }
+    .repo-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ===================== SETUP WIZARD ===================== -->
+<div id="setup" class="container">
+  <div class="setup-header">
+    <h1>Pod-Sync</h1>
+    <p>Team coordination for AI-native dev pods</p>
+  </div>
+  <div class="step-indicator">
+    <div class="step-dot active" id="dot-1"></div>
+    <div class="step-dot" id="dot-2"></div>
+    <div class="step-dot" id="dot-3"></div>
+  </div>
+
+  <div class="step active" id="step-1">
+    <h2 style="margin-bottom:16px">Select your IDE</h2>
+    <div class="ide-cards">
+      <div class="ide-card" data-ide="windsurf" onclick="selectIDE('windsurf')">
+        <div class="icon">W</div><div class="label">Windsurf</div><div class="detected">Detected</div>
+      </div>
+      <div class="ide-card" data-ide="vscode" onclick="selectIDE('vscode')">
+        <div class="icon">VS</div><div class="label">VS Code</div><div class="detected">Detected</div>
+      </div>
+      <div class="ide-card" data-ide="opencode" onclick="selectIDE('opencode')">
+        <div class="icon">OC</div><div class="label">OpenCode</div><div class="detected">Detected</div>
+      </div>
+    </div>
+    <div class="step-nav"><button class="primary" id="step1-next" onclick="goToStep(2)" disabled>Next</button></div>
+  </div>
+
+  <div class="step" id="step-2">
+    <h2 style="margin-bottom:16px">Git authentication</h2>
+    <div class="auth-options">
+      <div class="auth-option" onclick="selectAuth('ssh')"><h3>SSH Key</h3><p>Recommended. Uses your existing SSH key.</p></div>
+      <div class="auth-option" onclick="selectAuth('pat')"><h3>Personal Access Token</h3><p>Stored in your OS keychain. Never touches the repo.</p></div>
+    </div>
+    <div class="auth-panel" id="auth-ssh">
+      <button onclick="testSSH()">Test SSH connection</button>
+      <div class="auth-result" id="ssh-result"></div>
+      <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">No SSH key? <a href="https://github.com/settings/ssh" target="_blank">Add one here</a> then click Re-test.</p>
+    </div>
+    <div class="auth-panel" id="auth-pat">
+      <div style="display:flex;gap:8px"><input type="password" id="pat-input" placeholder="ghp_xxxxxxxxxxxx"><button onclick="storePAT()">Store</button></div>
+      <div class="auth-result" id="pat-result"></div>
+      <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">Generate a token at <a href="https://github.com/settings/tokens" target="_blank">github.com/settings/tokens</a></p>
+    </div>
+    <div class="step-nav">
+      <button onclick="goToStep(1)">Back</button>
+      <button class="primary" id="step2-next" onclick="goToStep(3)" disabled>Next</button>
+    </div>
+  </div>
+
+  <div class="step" id="step-3">
+    <div class="success-screen" id="completing" style="display:none"><p>Completing setup...</p></div>
+    <div class="success-screen" id="complete-success" style="display:none">
+      <div class="checkmark">&#10003;</div>
+      <h2>You're all set</h2>
+      <p style="color:var(--text-muted)">Pod-Sync is installed and ready.</p>
+      <div class="examples">
+        <p style="margin-bottom:8px;font-weight:600">Try saying:</p>
+        <code>"log my status for today"</code>
+        <code>"catch me up on the team"</code>
+        <code>"who's active right now?"</code>
+        <code>"create an openspec proposal for rate limiting"</code>
+      </div>
+      <p style="margin-top:16px;color:var(--text-muted);font-size:13px">Redirecting to dashboard in <span id="countdown">3</span>s...</p>
+    </div>
+    <div class="success-screen" id="complete-error" style="display:none">
+      <h2 style="color:var(--red)">Setup failed</h2>
+      <p id="complete-error-msg" style="color:var(--text-muted)"></p>
+      <button onclick="goToStep(1)" style="margin-top:16px">Start over</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== LEVEL 1: HOME (repo overview) ===================== -->
+<div id="home" class="container">
+  <div class="home-header">
+    <h1>Pod-Sync</h1>
+  </div>
+  <div id="repo-grid" class="repo-grid"></div>
+</div>
+
+<!-- ===================== LEVEL 2: REPO DETAIL ===================== -->
+<div id="repo-view" class="container">
+  <div class="repo-header">
+    <button class="back-btn" onclick="goHome()">&larr; Back</button>
+    <h1 id="repo-view-name"></h1>
+    <span class="branch-label">logging</span>
+    <input type="text" class="search-bar" id="repo-search-input" placeholder="Search entries...">
+  </div>
+  <div class="dash-body">
+    <div class="presence-panel">
+      <h3>Presence</h3>
+      <div id="repo-presence-list"></div>
+      <div class="not-logged-section" id="repo-not-logged-section" style="display:none">
+        <h4>Not logged today</h4>
+        <div id="repo-not-logged-list"></div>
+      </div>
+    </div>
+    <div class="feed" id="repo-feed"></div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let selectedIDE = null;
+let selectedAuth = null;
+let authVerified = false;
+let currentRepoPath = null;
+let currentRepoEntries = [];
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+async function init() {
+  const res = await fetch('/api/setup-status');
+  const data = await res.json();
+  if (data.setup_complete) {
+    showHome();
+  } else {
+    showSetup();
+  }
+}
+
+function showSetup() {
+  document.getElementById('setup').style.display = 'block';
+  document.getElementById('home').style.display = 'none';
+  document.getElementById('repo-view').style.display = 'none';
+  detectIDEs();
+}
+
+function showHome() {
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('home').style.display = 'block';
+  document.getElementById('repo-view').style.display = 'none';
+  loadRepos();
+}
+
+function showRepoView(path, name) {
+  currentRepoPath = path;
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('home').style.display = 'none';
+  document.getElementById('repo-view').style.display = 'block';
+  document.getElementById('repo-view-name').textContent = name;
+  document.getElementById('repo-search-input').value = '';
+  loadRepoData(path);
+}
+
+function goHome() {
+  currentRepoPath = null;
+  showHome();
+}
+
+// ---------------------------------------------------------------------------
+// Setup Wizard (unchanged logic)
+// ---------------------------------------------------------------------------
+function goToStep(n) {
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+  document.getElementById('step-' + n).classList.add('active');
+  for (let i = 1; i <= 3; i++) {
+    const dot = document.getElementById('dot-' + i);
+    dot.classList.remove('active', 'done');
+    if (i < n) dot.classList.add('done');
+    else if (i === n) dot.classList.add('active');
+  }
+  if (n === 3) completeSetup();
+}
+
+async function detectIDEs() {
+  try {
+    const res = await fetch('/api/detect-ides');
+    const data = await res.json();
+    let detected = [];
+    for (const [ide, found] of Object.entries(data)) {
+      if (found) {
+        detected.push(ide);
+        const card = document.querySelector(`.ide-card[data-ide="${ide}"]`);
+        if (card) card.classList.add('detected-ide');
+      }
+    }
+    if (detected.length === 1) selectIDE(detected[0]);
+  } catch (e) {}
+}
+
+function selectIDE(ide) {
+  selectedIDE = ide;
+  document.querySelectorAll('.ide-card').forEach(c => c.classList.remove('selected'));
+  document.querySelector(`.ide-card[data-ide="${ide}"]`).classList.add('selected');
+  document.getElementById('step1-next').disabled = false;
+}
+
+function selectAuth(method) {
+  selectedAuth = method;
+  document.querySelectorAll('.auth-option').forEach(o => o.classList.remove('selected'));
+  event.currentTarget.classList.add('selected');
+  document.querySelectorAll('.auth-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('auth-' + method).classList.add('active');
+}
+
+async function testSSH() {
+  const el = document.getElementById('ssh-result');
+  el.className = 'auth-result'; el.textContent = 'Testing...'; el.style.display = 'block';
+  try {
+    const res = await fetch('/api/test-ssh', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      el.className = 'auth-result success'; el.textContent = 'SSH authentication verified.';
+      authVerified = true; document.getElementById('step2-next').disabled = false;
+    } else { el.className = 'auth-result error'; el.textContent = data.message || 'SSH test failed.'; }
+  } catch (e) { el.className = 'auth-result error'; el.textContent = 'Connection error.'; }
+}
+
+async function storePAT() {
+  const pat = document.getElementById('pat-input').value.trim();
+  const el = document.getElementById('pat-result');
+  if (!pat) { el.className = 'auth-result error'; el.textContent = 'Enter a token.'; return; }
+  el.className = 'auth-result'; el.textContent = 'Storing...'; el.style.display = 'block';
+  try {
+    const res = await fetch('/api/store-pat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pat }) });
+    const data = await res.json();
+    if (data.success) {
+      el.className = 'auth-result success'; el.textContent = 'PAT stored and verified.';
+      authVerified = true; document.getElementById('step2-next').disabled = false;
+    } else { el.className = 'auth-result error'; el.textContent = data.message || 'Failed.'; }
+  } catch (e) { el.className = 'auth-result error'; el.textContent = 'Connection error.'; }
+}
+
+async function completeSetup() {
+  const completing = document.getElementById('completing');
+  const success = document.getElementById('complete-success');
+  const error = document.getElementById('complete-error');
+  completing.style.display = 'block'; success.style.display = 'none'; error.style.display = 'none';
+  try {
+    const res = await fetch('/api/complete-setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ide: selectedIDE }) });
+    const data = await res.json();
+    completing.style.display = 'none';
+    if (data.success) {
+      success.style.display = 'block';
+      let countdown = 3;
+      const timer = setInterval(() => { countdown--; document.getElementById('countdown').textContent = countdown; if (countdown <= 0) { clearInterval(timer); showHome(); } }, 1000);
+    } else {
+      error.style.display = 'block'; document.getElementById('complete-error-msg').textContent = (data.errors || []).join(', ') || 'Unknown error.';
+    }
+  } catch (e) { completing.style.display = 'none'; error.style.display = 'block'; document.getElementById('complete-error-msg').textContent = 'Connection error.'; }
+}
+
+// ---------------------------------------------------------------------------
+// Level 1 — Home (repo overview)
+// ---------------------------------------------------------------------------
+async function loadRepos() {
+  const grid = document.getElementById('repo-grid');
+  try {
+    const res = await fetch('/api/repos');
+    const repos = await res.json();
+    if (!repos.length) {
+      grid.innerHTML = '<div class="empty-home"><h3>No repos registered yet</h3><p>Log your first status from any project repo in your IDE.<br>Repos appear here automatically.</p></div>';
+      return;
+    }
+    grid.innerHTML = repos.map(r => renderRepoCard(r)).join('');
+  } catch (e) {
+    grid.innerHTML = '<div class="empty-home"><h3>Cannot load repos</h3><p>Is the server running?</p></div>';
+  }
+}
+
+function renderRepoCard(r) {
+  const lastLog = r.last_log_timestamp ? timeAgo(r.last_log_timestamp) : 'no logs yet';
+  const membersHtml = (r.members || []).map(m => `<span class="member-chip">${esc(m)}</span>`).join('');
+  return `
+    <div class="repo-card" onclick="showRepoView('${esc(r.path)}', '${esc(r.name)}')">
+      <div class="repo-card-name">${esc(r.name)}</div>
+      <div class="repo-card-stats">
+        <div class="repo-card-stat"><span class="dot active"></span>${r.active_count} active</div>
+        <div class="repo-card-stat">${r.logged_today} logged today</div>
+        <div class="repo-card-stat">last log ${lastLog}</div>
+      </div>
+      <div class="repo-card-members">${membersHtml}</div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Level 2 — Repo detail
+// ---------------------------------------------------------------------------
+async function loadRepoData(path) {
+  loadRepoEntries(path);
+  loadRepoPresence(path);
+}
+
+async function loadRepoEntries(path) {
+  try {
+    const res = await fetch('/api/repo/entries?path=' + encodeURIComponent(path));
+    currentRepoEntries = await res.json();
+    renderRepoFeed(currentRepoEntries);
+  } catch (e) {
+    document.getElementById('repo-feed').innerHTML = '<div class="empty-state"><h3>Cannot load entries</h3></div>';
+  }
+}
+
+async function loadRepoPresence(path) {
+  try {
+    const res = await fetch('/api/repo/presence?path=' + encodeURIComponent(path));
+    const presence = await res.json();
+    renderRepoPresence(presence);
+  } catch (e) {}
+}
+
+function renderRepoFeed(entries) {
+  const feed = document.getElementById('repo-feed');
+  if (!entries.length) {
+    feed.innerHTML = '<div class="empty-state"><h3>No entries yet</h3><p>Log your first status from your IDE.</p></div>';
+    return;
+  }
+  entries.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+  feed.innerHTML = entries.map(e => {
+    if (e.type === 'status') return renderStatusCard(e);
+    if (e.type === 'openspec_proposal') return renderOpenspecCard(e);
+    return '';
+  }).join('');
+}
+
+function renderStatusCard(e) {
+  return `
+    <div class="feed-card">
+      <div class="feed-card-header">
+        <span class="feed-card-author">${esc(e.author)}</span>
+        <span class="feed-card-date">${esc(e.date)}</span>
+        <span class="feed-card-type type-status">status</span>
+      </div>
+      <div class="feed-card-body">
+        <div>${esc(e.summary)}</div>
+        ${e.blockers && e.blockers !== 'None' ? `<div class="field"><div class="field-label">Blockers</div><div class="field-value">${esc(e.blockers)}</div></div>` : ''}
+        ${e.next_up ? `<div class="field"><div class="field-label">Next up</div><div class="field-value">${esc(e.next_up)}</div></div>` : ''}
+        ${e.files_touched && e.files_touched.length ? `<div class="field"><div class="field-label">Files</div><div class="field-value" style="font-size:13px;color:var(--text-muted)">${e.files_touched.map(f => esc(f)).join(', ')}</div></div>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderOpenspecCard(e) {
+  return `
+    <div class="feed-card">
+      <div class="feed-card-header">
+        <span class="feed-card-author">${esc(e.author)}</span>
+        <span class="feed-card-date">${esc(e.date)}</span>
+        <span class="feed-card-type type-openspec">openspec</span>
+      </div>
+      <div class="feed-card-body">
+        <div style="font-weight:600">${esc(e.title)}</div>
+        <div style="margin-top:4px;font-size:13px;color:var(--text-muted)">${esc(e.event_type)}</div>
+        ${e.notes ? `<div style="margin-top:8px">${esc(e.notes)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderRepoPresence(presence) {
+  const list = document.getElementById('repo-presence-list');
+  const names = Object.keys(presence);
+  if (!names.length) {
+    list.innerHTML = '<p style="font-size:13px;color:var(--text-muted)">No teammates online</p>';
+    return;
+  }
+  const now = Date.now();
+  let html = '';
+  names.forEach(name => {
+    const info = presence[name];
+    const lastSeen = new Date(info.last_seen);
+    const mins = Math.round((now - lastSeen.getTime()) / 60000);
+    const isActive = mins <= 30;
+    const timeStr = mins < 1 ? 'just now' : mins < 60 ? `${mins}m ago` : `${Math.floor(mins/60)}h ago`;
+    html += `<div class="presence-entry"><div class="presence-name"><span class="dot ${isActive ? 'active' : 'away'}"></span>${esc(name)}</div><div class="presence-detail">${timeStr}${info.branch ? ' &middot; ' + esc(info.branch) : ''}</div></div>`;
+  });
+  list.innerHTML = html;
+
+  // Not logged today
+  const today = new Date().toISOString().slice(0, 10);
+  const loggedToday = new Set(currentRepoEntries.filter(e => e.date === today && e.type === 'status').map(e => e.author));
+  const notLogged = names.filter(n => !loggedToday.has(n));
+  const section = document.getElementById('repo-not-logged-section');
+  if (notLogged.length) {
+    section.style.display = 'block';
+    document.getElementById('repo-not-logged-list').innerHTML = notLogged.map(n => `<div class="not-logged-name">${esc(n)}</div>`).join('');
+  } else { section.style.display = 'none'; }
+}
+
+// Search within repo
+let repoSearchTimeout;
+document.addEventListener('DOMContentLoaded', () => {
+  const input = document.getElementById('repo-search-input');
+  if (input) {
+    input.addEventListener('input', () => {
+      clearTimeout(repoSearchTimeout);
+      const q = input.value.trim();
+      if (!q) { renderRepoFeed(currentRepoEntries); return; }
+      repoSearchTimeout = setTimeout(async () => {
+        try {
+          const res = await fetch('/api/repo/search?path=' + encodeURIComponent(currentRepoPath) + '&q=' + encodeURIComponent(q));
+          const results = await res.json();
+          renderRepoFeed(results);
+        } catch (e) {}
+      }, 300);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+function esc(str) { if (!str) return ''; const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
+
+function timeAgo(ts) {
+  if (!ts) return '';
+  const diff = Date.now() - new Date(ts).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+// Boot
+init();
+</script>
+</body>
+</html>
