@@ -467,17 +467,50 @@ def derive_presence(project: pathlib.Path) -> dict:
     return presence
 
 # ---------------------------------------------------------------------------
-# CLI command — install-skills
+# Skill installation
+#
+# Skills follow the Agent Skills convention: one folder per skill containing
+# a SKILL.md (skills/pod-sync-update/SKILL.md). Windsurf, VS Code (Copilot),
+# and OpenCode all read this structure — from different directories:
+#
+#                workspace                    global
+#   windsurf     .windsurf/skills/            (none — workspace only)
+#   vscode       .github/skills/              ~/.copilot/skills/
+#   opencode     .opencode/skills/            ~/.config/opencode/skills/
 # ---------------------------------------------------------------------------
+
+WINDSURF_NO_GLOBAL_MSG = (
+    "Windsurf loads skills per project — run 'pod-sync install-skills .' "
+    "inside each project repo."
+)
+
+
+def _skill_dirs():
+    """Skill source folders in this repo (each contains a SKILL.md)."""
+    return sorted(
+        d for d in SKILLS_DIR.iterdir()
+        if d.is_dir() and (d / "SKILL.md").exists()
+    )
+
+
+def _copy_skills(dest: pathlib.Path):
+    """Copy every skill folder into dest/<skill-name>/. Returns names copied."""
+    installed = []
+    for skill_dir in _skill_dirs():
+        shutil.copytree(skill_dir, dest / skill_dir.name, dirs_exist_ok=True)
+        installed.append(skill_dir.name)
+    return installed
+
 
 def cmd_install_skills(target=None):
     """
     CLI handler for: pod-sync install-skills [.]
 
-    Detects the user's IDE and copies Pod-Sync skill files into the
+    Detects the user's IDE and copies Pod-Sync skill folders into the
     appropriate skills directory.
 
     target=None  → global install, skills available from every repo in that IDE
+                   (not supported by Windsurf, which is workspace-only)
     target="."   → local install, skills scoped to the current working directory only
 
     IDE detection order: windsurf → vscode → opencode
@@ -496,36 +529,34 @@ def cmd_install_skills(target=None):
     if target == ".":
         cwd = pathlib.Path.cwd()
         if ide == "windsurf":
-            dest = cwd / ".windsurf" / "rules"
+            dest = cwd / ".windsurf" / "skills"
         elif ide == "vscode":
-            dest = cwd / ".github"
+            dest = cwd / ".github" / "skills"
         elif ide == "opencode":
             dest = cwd / ".opencode" / "skills"
         else:
-            dest = cwd / ".skills"
+            # Cross-tool convention recognized by VS Code and OpenCode.
+            dest = cwd / ".agents" / "skills"
         install_scope = f"local ({cwd.name})"
     else:
         if ide == "windsurf":
-            dest = pathlib.Path.home() / ".codeium" / "windsurf" / "memories"
+            print(f"  {WINDSURF_NO_GLOBAL_MSG}")
+            sys.exit(1)
         elif ide == "vscode":
-            dest = pathlib.Path.home() / ".vscode" / "skills"
+            dest = pathlib.Path.home() / ".copilot" / "skills"
         elif ide == "opencode":
             dest = pathlib.Path.home() / ".config" / "opencode" / "skills"
         else:
             print("No supported IDE detected (windsurf, code, opencode).")
-            print("Copy the files in skills/ manually to your IDE's skills directory.")
+            print("Copy the folders in skills/ manually to your IDE's skills directory.")
             sys.exit(1)
         install_scope = "global"
 
     dest.mkdir(parents=True, exist_ok=True)
-
-    installed = []
-    for skill_file in SKILLS_DIR.glob("*.md"):
-        shutil.copy2(skill_file, dest / skill_file.name)
-        installed.append(skill_file.name)
+    installed = _copy_skills(dest)
 
     if not installed:
-        print("No skill files found in skills/. Is SKILLS_DIR correct?")
+        print("No skill folders found in skills/. Is SKILLS_DIR correct?")
         sys.exit(1)
 
     print()
@@ -534,14 +565,12 @@ def cmd_install_skills(target=None):
     print(f"     Scope: {install_scope}")
     print(f"     Path:  {dest}")
     print()
-    for f in installed:
-        print(f"     - {f}")
+    for name in installed:
+        print(f"     - {name}/SKILL.md")
     print()
     if target == ".":
         print("  Skills are active for this repo only.")
-        print("  Run without '.' to install globally across all repos.")
-        print()
-        print(f"  Note: consider adding {dest.name}/pod-sync-*.md to your .gitignore")
+        print(f"  Note: consider adding {dest.relative_to(pathlib.Path.cwd())}/pod-sync-* to your .gitignore")
         print("  if you don't want to commit these to the project repo.")
     else:
         print("  Skills are now active in every project you open in this IDE.")
@@ -1224,11 +1253,15 @@ def build_app(include_setup=True):
         except Exception as e:
             errors.append(f"MCP config: {e}")
 
+        note = ""
         try:
             if ide == "windsurf":
-                skills_dest = pathlib.Path.home() / ".codeium" / "windsurf" / "memories"
+                # Windsurf has no global skills directory — skills are
+                # per-workspace (.windsurf/skills/).
+                skills_dest = None
+                note = WINDSURF_NO_GLOBAL_MSG
             elif ide == "vscode":
-                skills_dest = pathlib.Path.home() / ".vscode" / "skills"
+                skills_dest = pathlib.Path.home() / ".copilot" / "skills"
             elif ide == "opencode":
                 skills_dest = pathlib.Path.home() / ".config" / "opencode" / "skills"
             else:
@@ -1236,8 +1269,7 @@ def build_app(include_setup=True):
 
             if skills_dest:
                 skills_dest.mkdir(parents=True, exist_ok=True)
-                for skill_file in SKILLS_DIR.glob("*.md"):
-                    shutil.copy2(skill_file, skills_dest / skill_file.name)
+                _copy_skills(skills_dest)
         except Exception as e:
             errors.append(f"Skills copy: {e}")
 
@@ -1246,7 +1278,7 @@ def build_app(include_setup=True):
 
         if errors:
             return JSONResponse({"success": False, "errors": errors})
-        return JSONResponse({"success": True, "ide": ide, "message": "Setup complete."})
+        return JSONResponse({"success": True, "ide": ide, "message": "Setup complete.", "note": note})
 
     return app
 
@@ -1389,6 +1421,7 @@ Commands:
   install-skills [.]    Install Pod-Sync skills to your IDE
                         Omit '.' for global install (all repos)
                         Add '.' for local install (current repo only)
+                        Windsurf only supports local installs — run with '.'
 
 Modes:
   --stdio               MCP stdio mode (spawned automatically by your IDE)

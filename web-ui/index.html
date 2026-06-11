@@ -206,12 +206,11 @@
       <div class="checkmark">&#10003;</div>
       <h2>You're all set</h2>
       <p style="color:var(--text-muted)">Pod-Sync is installed and ready.</p>
+      <p id="setup-note" style="display:none;margin-top:12px;padding:10px;border:1px solid var(--yellow);border-radius:var(--radius);color:var(--yellow);font-size:13px"></p>
       <div class="examples">
-        <p style="margin-bottom:8px;font-weight:600">Try saying:</p>
-        <code>"log my status for today"</code>
-        <code>"catch me up on the team"</code>
-        <code>"who's active right now?"</code>
-        <code>"create an openspec proposal for rate limiting"</code>
+        <p style="margin-bottom:8px;font-weight:600">Try:</p>
+        <code>/pod-sync-update — log this working session</code>
+        <code>/pod-sync-read — catch up on the team</code>
       </div>
       <p style="margin-top:16px;color:var(--text-muted);font-size:13px">Redirecting to dashboard in <span id="countdown">3</span>s...</p>
     </div>
@@ -404,7 +403,13 @@ async function completeSetup() {
     completing.style.display = 'none';
     if (data.success) {
       success.style.display = 'block';
-      let countdown = 3;
+      if (data.note) {
+        const note = document.getElementById('setup-note');
+        note.textContent = data.note;
+        note.style.display = 'block';
+      }
+      let countdown = data.note ? 10 : 3;  // give the note time to be read
+      document.getElementById('countdown').textContent = countdown;
       const timer = setInterval(() => { countdown--; document.getElementById('countdown').textContent = countdown; if (countdown <= 0) { clearInterval(timer); showHome(); } }, 1000);
     } else {
       error.style.display = 'block'; document.getElementById('complete-error-msg').textContent = (data.errors || []).join(', ') || 'Unknown error.';

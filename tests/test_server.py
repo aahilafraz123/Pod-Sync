@@ -334,6 +334,49 @@ def test_presence_empty_when_no_recent_activity(pod, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Skill installation
+# ---------------------------------------------------------------------------
+
+def test_skill_sources_follow_agent_skills_convention():
+    dirs = server._skill_dirs()
+    assert [d.name for d in dirs] == ["pod-sync-read", "pod-sync-update"]
+    for d in dirs:
+        text = (d / "SKILL.md").read_text()
+        assert text.startswith("---")
+        assert f"name: {d.name}" in text
+
+
+def test_install_skills_local_windsurf_layout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        server.shutil, "which", lambda cmd: "/usr/bin/windsurf" if cmd == "windsurf" else None
+    )
+    server.cmd_install_skills(".")
+    assert (tmp_path / ".windsurf" / "skills" / "pod-sync-update" / "SKILL.md").exists()
+    assert (tmp_path / ".windsurf" / "skills" / "pod-sync-read" / "SKILL.md").exists()
+
+
+def test_install_skills_global_windsurf_refuses(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        server.shutil, "which", lambda cmd: "/usr/bin/windsurf" if cmd == "windsurf" else None
+    )
+    with pytest.raises(SystemExit):
+        server.cmd_install_skills(None)
+    assert "per project" in capsys.readouterr().out
+    assert not (tmp_path / ".windsurf").exists()
+
+
+def test_install_skills_local_vscode_layout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        server.shutil, "which", lambda cmd: "/usr/bin/code" if cmd == "code" else None
+    )
+    server.cmd_install_skills(".")
+    assert (tmp_path / ".github" / "skills" / "pod-sync-update" / "SKILL.md").exists()
+
+
+# ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
 

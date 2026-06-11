@@ -16,13 +16,15 @@ A browser window opens. Pick your IDE. Authenticate once. Done.
 
 ## Usage
 
-Pod-Sync works through skills — structured instruction files that teach your IDE agent the full protocol. After install, run this once from any project repo:
+Pod-Sync works through skills — structured instruction files that teach your IDE agent the full protocol, following the cross-IDE [Agent Skills](https://code.visualstudio.com/docs/agent-customization/agent-skills) convention (`<skill-name>/SKILL.md`). After install:
 
 ```bash
-pod-sync install-skills
+pod-sync install-skills      # global — VS Code (~/.copilot/skills), OpenCode
+pod-sync install-skills .    # this repo only — required for Windsurf (.windsurf/skills)
 ```
 
-This drops two skills into your IDE's global skills directory. Invoke them as slash commands from any project repo:
+Windsurf loads skills per project, so run the local install once in each repo
+you work in. Then invoke the skills as slash commands:
 
 - **/pod-sync-update** — log your working session. The agent collects context from git automatically, shows you a draft, and pushes after you confirm. Run it as often as you like — each session is its own entry. If you created or updated OpenSpec changes, it mirrors those documents to the logging branch in the same flow.
 - **/pod-sync-read** — read what the team did. Ask for a specific person, a date range, who's active right now, or just "catch me up".
