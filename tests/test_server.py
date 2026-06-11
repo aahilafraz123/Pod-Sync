@@ -239,7 +239,14 @@ def test_old_entries_are_archived_and_still_readable(pod):
 # OpenSpec
 # ---------------------------------------------------------------------------
 
-def test_openspec_writes_proposal_files_and_event(pod):
+def test_openspec_mirrors_working_tree_docs_to_logging(pod):
+    # The OpenSpec library creates documents on the user's working branch;
+    # Pod-Sync only mirrors them to the logging branch.
+    change_dir = pod.alice / "openspec" / "changes" / "rate-limit"
+    change_dir.mkdir(parents=True)
+    (change_dir / "proposal.md").write_text("# Rate Limiting\n\nDetails.\n")
+    (change_dir / "tasks.md").write_text("- [ ] implement throttle\n")
+
     result = server.tool_log_openspec_event(
         title="Rate Limiting",
         repo="alice_repo",
@@ -247,12 +254,19 @@ def test_openspec_writes_proposal_files_and_event(pod):
         event_type="proposal_created",
         openspec_path="openspec/changes/rate-limit/",
         notes="Throttle the alert engine",
-        proposal_files={"openspec/changes/rate-limit/proposal.md": "# Rate Limiting\n\nDetails.\n"},
     )
     assert "OpenSpec event logged" in result
 
+    # Mirrored to logging on origin.
     doc = git_show(pod.origin, "logging:openspec/changes/rate-limit/proposal.md")
     assert doc is not None and "# Rate Limiting" in doc
+    tasks = git_show(pod.origin, "logging:openspec/changes/rate-limit/tasks.md")
+    assert tasks is not None and "throttle" in tasks
+
+    # Working tree copy untouched and still on the user's branch.
+    assert (change_dir / "proposal.md").read_text().startswith("# Rate Limiting")
+    branch = run(["git", "branch", "--show-current"], cwd=pod.alice).stdout.strip()
+    assert branch == "main"
 
     raw = git_show(pod.origin, "logging:entries/alice.jsonl")
     event = json.loads(raw.strip())
@@ -263,13 +277,34 @@ def test_openspec_writes_proposal_files_and_event(pod):
     assert "[openspec]" in out and "Rate Limiting" in out
 
 
+def test_openspec_requires_existing_docs(pod):
+    result = server.tool_log_openspec_event(
+        title="Ghost", repo="alice_repo", repo_path=str(pod.alice),
+        openspec_path="openspec/changes/does-not-exist/",
+    )
+    assert "not found in the working tree" in result
+
+    # Archiving is allowed even after OpenSpec moved the folder away.
+    result = server.tool_log_openspec_event(
+        title="Ghost", repo="alice_repo", repo_path=str(pod.alice),
+        event_type="proposal_archived",
+        openspec_path="openspec/changes/does-not-exist/",
+    )
+    assert "OpenSpec event logged" in result
+
+
 def test_openspec_rejects_path_escape(pod):
     result = server.tool_log_openspec_event(
         title="Evil", repo="alice_repo", repo_path=str(pod.alice),
-        proposal_files={"../../evil.md": "nope"},
+        openspec_path="../escape/",
     )
     assert "escapes the repo" in result
-    assert not (pod.tmp / "evil.md").exists()
+
+    result = server.tool_log_openspec_event(
+        title="Evil", repo="alice_repo", repo_path=str(pod.alice),
+        openspec_path="/etc",
+    )
+    assert "must be relative" in result
 
 
 # ---------------------------------------------------------------------------

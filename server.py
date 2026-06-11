@@ -792,10 +792,14 @@ def tool_log_openspec_event(
     event_type: str = "proposal_created",
     openspec_path: str = "openspec/changes/",
     notes: str = "",
-    proposal_files: Optional[dict] = None,
 ) -> str:
-    """Write proposal files and the event record to the project repo's logging
-    branch in a single commit."""
+    """Mirror OpenSpec documents from the user's working tree to the logging
+    branch and record the event, in one commit.
+
+    OpenSpec (the spec-driven development library) creates its documents on
+    the user's working branch as part of its own workflow. Pod-Sync only
+    mirrors them: the working tree is read, never modified, and the documents
+    keep living on the working branch as normal."""
     project = pathlib.Path(repo_path)
     if not project.exists():
         return f"Error: repo_path does not exist: {repo_path}"
@@ -803,6 +807,22 @@ def tool_log_openspec_event(
     author = git_config_username(cwd=project)
     if author == "Unknown":
         return "Error: git config user.name is not set. Run: git config --global user.name \"Your Name\""
+
+    if pathlib.Path(openspec_path).is_absolute():
+        return f"Error: openspec_path must be relative to the repo root: {openspec_path}"
+    src = project / openspec_path
+    try:
+        src.resolve().relative_to(project.resolve())
+    except ValueError:
+        return f"Error: openspec_path escapes the repo: {openspec_path}"
+
+    # Archiving may have moved the folder; for created/updated it must exist.
+    if not src.exists() and event_type != "proposal_archived":
+        return (
+            f"Error: {openspec_path} not found in the working tree. "
+            f"Run the OpenSpec workflow first — Pod-Sync mirrors existing "
+            f"documents, it does not create them."
+        )
 
     slug = author_slug(author)
 
@@ -815,18 +835,13 @@ def tool_log_openspec_event(
         try:
             _sync_worktree(wt)
 
-            # Write proposal content onto the logging branch. The agent passes
-            # file contents — it never writes to the user's working tree.
-            if proposal_files:
-                wt_resolved = wt.resolve()
-                for rel, content in proposal_files.items():
-                    target = wt / rel
-                    try:
-                        target.resolve().relative_to(wt_resolved)
-                    except ValueError:
-                        return f"Error: proposal file path escapes the repo: {rel}"
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content)
+            if src.exists():
+                dest = wt / openspec_path
+                if src.is_dir():
+                    shutil.copytree(src, dest, dirs_exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
 
             event = {
                 "id": str(uuid4()),
@@ -865,7 +880,7 @@ def tool_log_openspec_event(
 
     return (
         f"OpenSpec event logged. "
-        f"Proposal committed to {repo}/logging. "
+        f"Documents mirrored to {repo}/logging (working branch copy untouched). "
         f"Event visible in team dashboard."
     )
 
@@ -1302,25 +1317,24 @@ def run_stdio():
         event_type: str = "proposal_created",
         openspec_path: str = "openspec/changes/",
         notes: str = "",
-        proposal_files: Optional[dict[str, str]] = None,
     ) -> str:
         """
-        Called when an OpenSpec proposal is created or updated in a project repo.
-        Writes the proposal files and the event record to the logging branch in
-        a single commit. Never touches the user's working tree.
+        Called after the OpenSpec workflow creates, updates, or archives a
+        change in a project repo. Mirrors the OpenSpec documents from the
+        user's working tree to the logging branch and records the event, in
+        one commit. The working tree is only read — the documents keep living
+        on the user's working branch as normal.
 
         title: human-readable proposal title e.g. "Alert Engine Rate Limiting"
         repo: repo name e.g. "dashboard-repo"
         repo_path: absolute path to the project repo on this machine
         event_type: "proposal_created", "proposal_updated", "proposal_archived"
-        openspec_path: path within repo to the OpenSpec change folder
+        openspec_path: repo-relative path to the OpenSpec change folder,
+                       e.g. "openspec/changes/rate-limit/". The documents must
+                       already exist there (OpenSpec creates them).
         notes: optional one-line note about the proposal
-        proposal_files: mapping of repo-relative file path → full file content,
-                        e.g. {"openspec/changes/rate-limit/proposal.md": "# ..."}.
-                        Required for proposal_created/proposal_updated — this is
-                        how the proposal document reaches the logging branch.
         """
-        return tool_log_openspec_event(title, repo, repo_path, event_type, openspec_path, notes, proposal_files)
+        return tool_log_openspec_event(title, repo, repo_path, event_type, openspec_path, notes)
 
     @mcp.tool()
     def read_presence(repo_path: str) -> str:

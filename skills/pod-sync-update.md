@@ -1,215 +1,108 @@
 ---
 name: pod-sync-update
-description: "Use this skill ONLY when a team member explicitly wants to WRITE or LOG
-a new status entry. Triggers: 'log my work', 'write my status', 'end of day update',
-'log what I did today', 'add my entry', 'daily standup log'. Do NOT use for reading,
-summarizing, or checking what others did — that is pod-sync-read. Do NOT use for
-OpenSpec proposals — that is pod-sync-openspec. THIS SKILL WRITES. It calls the
-log_status() MCP tool which writes your entry to the project repo's logging
-branch and pushes it."
+description: "Invoked via /pod-sync-update (or when the user explicitly asks to
+log their status, e.g. 'log my work', 'end of day update', 'wrap up my day',
+'standup notes'). Logs the user's status — and mirrors any OpenSpec changes —
+to the project repo's logging branch through the Pod-Sync MCP tools. This is
+the WRITE flow. For reading the team log or checking presence, use
+/pod-sync-read instead."
 ---
 
-# Pod-Sync — Status Update Skill
+# Pod-Sync — Update Skill
 
-> **THIS IS A WRITE-ONLY SKILL.**
-> It calls `log_status()` to append a structured entry to your per-author entry
-> file (`entries/<author>.jsonl`) on the project repo's `logging` branch and push it.
-> It does not read entries. It does not summarize. It does not query.
-> If the user wants to READ the log, STOP — use `pod-sync-read` instead.
+Turn today's work into a structured status entry on the project repo's
+`logging` branch, and mirror any OpenSpec change documents alongside it.
+All writes go through two MCP tools: `log_status()` and `log_openspec_event()`.
+The tools work in a hidden Pod-Sync worktree — the user's branch, checkout,
+and uncommitted changes are never touched, by you or by the tools.
 
----
+## Boundaries
 
-## PERMISSION BOUNDARY
-
-```
 ALLOWED:
-  - Call log_status() MCP tool
-  - Run git commands to collect context (read-only git operations)
-  - Present a draft to the user for confirmation
+- Read-only git commands to collect context
+- Calling `log_status()` and `log_openspec_event()`
+- Presenting a draft and waiting for the user's confirmation
 
 FORBIDDEN:
-  - Reading entry files to display past entries (that is pod-sync-read)
-  - Summarizing or presenting other people's work
-  - Writing directly to any entry file or any file (the MCP tool handles all writes)
-  - Running git commit, git push, git add (the MCP tool handles all git writes)
-  - Touching any file outside the MCP tool's scope
-```
+- Writing any file, or running `git add`, `commit`, `push`, `checkout`, `stash`
+- Reading or summarizing the team log (that is /pod-sync-read — say so and stop)
+- Asking the user for their name (the tool auto-detects it from `git config user.name`)
+- Inventing field content that isn't in git or the conversation
+- Logging without the user's explicit confirmation
 
-If the user's request crosses this boundary, tell them which skill to use and stop.
+If the Pod-Sync MCP tools are not available in this session, stop and tell the
+user to run `./install.sh` from the pod-sync repo. Do not simulate the tools
+with git commands.
 
----
+## Procedure
 
-## HARD RULES
-
-1. **Never write to disk directly.** All writes go through `log_status()`. The MCP tool handles the entry file, archival, git commit, and git push. You call the tool. That is all.
-2. **Never read entries to display them.** If the user asks "what did I log yesterday?" mid-conversation, tell them to use `pod-sync-read`. Do not switch roles.
-3. **Never ask the user for their name.** Author is auto-detected by `log_status()` from `git config user.name`. If git config is not set, the MCP tool will return an error — surface it.
-4. **Never invent information.** If a field cannot be determined from git or conversation context, leave it empty or mark it unknown. Do not guess.
-5. **Confirm before calling the tool.** Show the user what will be logged. Wait for explicit approval.
-6. **One entry per call.** Do not batch multiple days or multiple authors into one invocation.
-
----
-
-## Execution Phases
-
-```
-PHASE 1 → Collect context (git data + conversation)
-PHASE 2 → Draft the entry and confirm with user
-PHASE 3 → Call log_status() MCP tool
-PHASE 4 → Report result
-```
-
-Complete each phase before moving to the next. Do not skip phases.
-
----
-
-## PHASE 1 — Collect Context
-
-> Reminder: THIS PHASE IS READ-ONLY COLLECTION. No writes happen here.
-
-**Goal:** Gather field data from the environment. The agent reads this from git automatically — the user should not need to type answers to a form.
-
-Run these to collect context:
+**1. Collect context** (read-only, silent — never ask the user for any of this):
 
 ```bash
-git config user.name                          # Author (used by MCP tool, not by you)
-git log --since="midnight" --oneline          # Work done today
-git diff --name-status HEAD                   # Uncommitted changes
-git diff --name-status origin/HEAD..HEAD      # Committed changes today
-git branch --show-current                     # Current branch
+git log --since="midnight" --oneline      # today's commits → summary
+git diff --name-status HEAD               # uncommitted changes → files_touched
+git stash list                            # stashed WIP → possible blockers
+git status --porcelain -- openspec/       # OpenSpec changes to mirror
 ```
 
-### Field extraction
+`repo_path` is the absolute path to the current workspace root.
 
-| Field | How to determine it |
-|-------|---------------------|
-| summary | Synthesize from commit messages + diff + conversation. 2-4 sentences, past tense, specific. |
-| files_touched | From git diff output. List of file paths modified today. Can be empty. |
-| blockers | Stash entries, uncommitted WIP, TODO/FIXME in touched files, or anything the user mentions. "None" if clean. |
-| next_up | From conversation context, open TODOs, or user's stated plans. Specific enough a teammate could continue it. |
+**2. Draft the entry** from git output plus conversation context:
 
-### When a field cannot be determined
+| Field | How to fill it |
+|-------|----------------|
+| summary | 2-4 sentences, past tense, specific. What was worked on and why it matters. |
+| files_touched | File paths from the diff. Can be empty. |
+| blockers | Stashed WIP, stuck work, anything the user mentions. "None" if clean. |
+| next_up | What picks up tomorrow — specific enough that a teammate could continue it. |
 
-Do not omit it silently. Do not fabricate. Mark it:
+If a field cannot be determined, mark it "not detected" in the draft — do not
+fabricate. If `openspec/changes/` folders were created or modified, include
+them in the draft as "also mirror OpenSpec change: [folder]".
 
-```
-Not detected — fill in if needed, or leave empty.
-```
-
----
-
-## Repo context — collect this silently before calling any tool
-
-Before calling any MCP tool, run these git commands in the current workspace
-and use the output to populate the call. Never ask the user for any of this.
-
-1. `git remote get-url origin`     → determines which repo this is
-2. `git branch --show-current`     → current branch (for context only, not logged)
-3. `git log --since="midnight" --oneline`  → today's commits, use to help write summary
-4. `git diff --name-status HEAD`   → files touched today, use for files_touched param
-
-Pass `repo_path` as the absolute path to the current workspace root.
-The MCP tool does all reading, writing, and pushing through a hidden Pod-Sync
-worktree — it never switches branches or touches the user's working tree.
-Never switch branches manually. Never write to entry files directly.
-
----
-
-## PHASE 2 — Draft and Confirm
-
-> Reminder: THIS PHASE IS STILL READ-ONLY. No tool calls yet. No writes.
-
-**Goal:** Present the collected data to the user for approval before anything is written.
-
-Show this and wait for a response:
+**3. Confirm** — show the draft and wait:
 
 ```
 Here's what I'll log:
-
-  Summary:   [synthesized from git + conversation]
-  Files:     [list, or "none detected"]
-  Blockers:  [detected, or "None"]
-  Next up:   [detected, or "not specified"]
-
+  Summary:   [...]
+  Files:     [...]
+  Blockers:  [...]
+  Next up:   [...]
+  OpenSpec:  [change folders to mirror, or "none"]
 Say "go" to submit, or correct anything above.
 ```
 
-**Do not call `log_status()` until the user confirms.**
+Do not call any tool until the user approves. Re-present after corrections.
 
-If the user corrects something, update the draft and re-present it before proceeding.
-
----
-
-## PHASE 3 — Call the MCP Tool
-
-> THIS IS THE ONLY PHASE THAT WRITES. Everything goes through one tool call.
-
-Call `log_status()` with the confirmed fields:
+**4. Call the tools:**
 
 ```
-log_status(
-    summary="[confirmed summary]",
-    repo_path="[absolute path to workspace root]",
-    files_touched=["path/to/file1", "path/to/file2"],
-    blockers="[confirmed blockers or 'None']",
-    next_up="[confirmed next_up]"
-)
+log_status(summary=..., repo_path=..., files_touched=[...], blockers=..., next_up=...)
 ```
 
-If the user already logged today and chose to append or replace, pass
-`mode="update"` or `mode="replace"` respectively. Omit `mode` for a normal
-first entry of the day.
-
-The MCP tool handles everything from here:
-- Auto-detects author from `git config user.name`
-- Generates entry ID, date, week, timestamp
-- Checks for duplicate entry today (returns prompt to append or replace)
-- Syncs the logging branch from origin
-- Appends to your per-author entry file (`entries/<author>.jsonl`) via atomic write
-- Runs archival to maintain the 90-day rolling window
-- Commits and pushes to the project repo's `logging` branch — the user's
-  working tree is never touched
-
-**You do not run git add, git commit, or git push. The tool does.**
-
----
-
-## PHASE 4 — Report Result
-
-> Reminder: BACK TO READ-ONLY. This phase only reports what the tool returned.
-
-If the tool returns success, confirm to the user:
+Then, for each confirmed OpenSpec change folder:
 
 ```
-Status logged and pushed.
+log_openspec_event(title=..., repo=..., repo_path=...,
+                   event_type="proposal_created" | "proposal_updated" | "proposal_archived",
+                   openspec_path="openspec/changes/[folder]/", notes=...)
 ```
 
-If the tool returns an error:
-- **Auth/SSO error:** Tell the user to re-authorize their SSH key or PAT. Link: https://github.com/settings/ssh
-- **Duplicate entry for today:** The tool will ask whether to append or replace. Present the question to the user, then call the tool again with `mode="update"` (append) or `mode="replace"`.
-- **Any other error:** Surface the tool's error message. Do not retry without the user's input.
+`log_openspec_event` copies the documents from the working tree to the logging
+branch — they keep living on the user's working branch as normal. OpenSpec's
+own workflow creates the documents; Pod-Sync only mirrors them.
 
----
+**5. Report the result** — relay the tool's message. On success: "Status logged
+and pushed."
 
-## Edge Cases
+## Edge cases
 
 | Situation | Action |
 |-----------|--------|
-| User already logged today | The MCP tool detects this. Ask the user: append as mid-day update (`mode="update"`), or replace the earlier entry (`mode="replace"`)? |
-| User says "just log it" with no detail | Ask for a one-sentence summary minimum. Do not log an empty entry. |
-| User asks to see their previous entry | That is a READ operation. Tell them to use `pod-sync-read`. Do not read entry files yourself. |
-| Push fails with SSO/auth error | Surface the error. Link to https://github.com/settings/ssh. Do not retry silently. |
-| Git config user.name is not set | The MCP tool will return an error. Tell the user to run `git config --global user.name "Their Name"`. |
-
----
-
-## What This Skill Does NOT Do
-
-These are explicit exclusions. If you find yourself doing any of these, you are in the wrong skill.
-
-- Read or display past entries (use `pod-sync-read`)
-- Summarize what the team did (use `pod-sync-read`)
-- Check who is active / online (use `pod-sync-read` with `read_presence()`)
-- Create or update OpenSpec proposals (use `pod-sync-openspec`)
-- Write directly to any entry file or any file on disk
-- Run `git commit`, `git push`, `git add` directly
+| User already logged today | The tool says so. Ask: append (`mode="update"`) or replace (`mode="replace"`)? Call again with their choice. |
+| "Just log it" with no detail | Ask for a one-sentence summary minimum. Do not log an empty entry. |
+| Auth/SSO push failure | Surface the tool's message; it links to re-authorization. Do not retry silently. |
+| "Entry saved locally but push failed" | Tell the user; the next successful log will push it. |
+| `git config user.name` not set | Tool returns an error — tell the user to set it. |
+| Ambiguous which OpenSpec folder changed | Ask the user which to mirror. Do not guess. |
+| User asks to read the log mid-flow | That is /pod-sync-read. Say so and stop. |

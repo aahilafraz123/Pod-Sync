@@ -22,13 +22,20 @@ Pod-Sync works through skills — structured instruction files that teach your I
 pod-sync install-skills
 ```
 
-This drops three skills into your IDE's global skills directory. Once installed, open your IDE and invoke them directly from the Skills panel:
+This drops two skills into your IDE's global skills directory. Invoke them as slash commands from any project repo:
 
-- **pod-sync-update** — log your end-of-day status. The agent collects context from git automatically, shows you a draft, and pushes after you confirm.
-- **pod-sync-read** — read what the team did. Ask for a specific person, a date range, or just catch me up on everyone.
-- **pod-sync-openspec** — create or update an OpenSpec proposal. The agent commits it to the logging branch of your current repo and surfaces it in the team dashboard.
+- **/pod-sync-update** — log your end-of-day status. The agent collects context from git automatically, shows you a draft, and pushes after you confirm. If you created or updated OpenSpec changes today, it mirrors those documents to the logging branch in the same flow.
+- **/pod-sync-read** — read what the team did. Ask for a specific person, a date range, who's active right now, or just "catch me up".
 
 Or open the dashboard directly: **http://localhost:7823**
+
+## OpenSpec integration
+
+Pod-Sync does not replace [OpenSpec](https://github.com/Fission-AI/OpenSpec) —
+you keep using OpenSpec's own workflow, which creates documents under
+`openspec/changes/` on your working branch as normal. Pod-Sync mirrors those
+documents to the `logging` branch (read-only against your working tree) so the
+whole team's proposals are viewable in one place alongside status updates.
 
 ## How it works
 
@@ -58,7 +65,8 @@ All data lives on each project repo's `logging` branch:
 - Status entries and OpenSpec events → `entries/<author>.jsonl` (one file per
   author, so teammates never hit git merge conflicts)
 - Older than 90 days → `archive/<author>-YYYY-W##.jsonl`
-- OpenSpec proposal documents → `openspec/changes/...`
+- Mirrored OpenSpec documents → `openspec/changes/...` (originals stay on
+  your working branch)
 - Nothing is ever deleted. Archive is fully searchable.
 
 Presence ("who's active right now?") is derived from recent commit activity
