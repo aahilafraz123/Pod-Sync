@@ -138,33 +138,51 @@ def test_concurrent_authors_do_not_conflict(pod):
     assert "Bob second." in out
 
 
-def test_duplicate_update_and_replace_modes(pod):
-    assert "Logged and pushed" in server.tool_log_status("Morning entry.", str(pod.alice))
+def test_branch_creation_is_reported_once(pod):
+    first = server.tool_log_status("First ever entry.", str(pod.alice))
+    assert "created" in first and "logging" in first
 
-    dup = server.tool_log_status("Second try.", str(pod.alice))
-    assert "already have a status entry" in dup
-    assert 'mode="update"' in dup and 'mode="replace"' in dup
+    second = server.tool_log_status("Second session.", str(pod.alice))
+    assert "Note: the 'logging' branch did not exist" not in second
 
-    assert "Logged and pushed" in server.tool_log_status(
-        "Mid-day addition.", str(pod.alice), mode="update")
-    raw = git_show(pod.origin, "logging:entries/alice.jsonl")
-    assert len(raw.strip().splitlines()) == 2
-
-    assert "Logged and pushed" in server.tool_log_status(
-        "Replaced entry.", str(pod.alice), mode="replace")
-    raw = git_show(pod.origin, "logging:entries/alice.jsonl")
-    lines = [json.loads(l) for l in raw.strip().splitlines()]
-    assert len(lines) == 1
-    assert lines[0]["summary"] == "Replaced entry."
+    # A teammate whose repo gets the branch from origin is not told it was
+    # "created" — it already existed for the team.
+    bob_log = server.tool_log_status("Bob's entry.", str(pod.bob))
+    assert "Note: the 'logging' branch did not exist" not in bob_log
 
 
-def test_legacy_prefix_protocol_still_works(pod):
-    server.tool_log_status("First.", str(pod.alice))
-    assert "Logged and pushed" in server.tool_log_status("[replace] Via prefix.", str(pod.alice))
+def test_sessions_append_without_prompting(pod):
+    assert "Logged and pushed" in server.tool_log_status("Morning session.", str(pod.alice))
+    second = server.tool_log_status("Afternoon session.", str(pod.alice))
+    assert "Logged and pushed" in second
+    assert "session 2 today" in second
+
     raw = git_show(pod.origin, "logging:entries/alice.jsonl")
     lines = [json.loads(l) for l in raw.strip().splitlines()]
-    assert len(lines) == 1
-    assert lines[0]["summary"] == "Via prefix."
+    assert [e["summary"] for e in lines] == ["Morning session.", "Afternoon session."]
+
+    # "today" returns every session; "latest" returns only the newest per author.
+    out = server.tool_read_status(str(pod.alice), when="today")
+    assert "Morning session." in out and "Afternoon session." in out
+    out = server.tool_read_status(str(pod.alice), when="latest")
+    assert "Afternoon session." in out and "Morning session." not in out
+
+
+def test_replace_swaps_only_the_most_recent_entry(pod):
+    server.tool_log_status("Morning session.", str(pod.alice))
+    server.tool_log_status("Afternoon session.", str(pod.alice))
+
+    result = server.tool_log_status("Afternoon, corrected.", str(pod.alice), mode="replace")
+    assert "Logged and pushed" in result
+
+    raw = git_show(pod.origin, "logging:entries/alice.jsonl")
+    lines = [json.loads(l) for l in raw.strip().splitlines()]
+    assert [e["summary"] for e in lines] == ["Morning session.", "Afternoon, corrected."]
+
+
+def test_replace_with_nothing_to_replace(pod):
+    result = server.tool_log_status("Oops.", str(pod.alice), mode="replace")
+    assert "Nothing to replace" in result
 
 
 # ---------------------------------------------------------------------------
@@ -185,23 +203,6 @@ def test_read_status_filters_by_author_and_query(pod):
     assert out == "No entries found for that query."
 
 
-def test_read_status_legacy_entries_json_compat(pod):
-    # Pods that used the old single-file store can still read their history.
-    wt = server.ensure_logging_worktree(pod.alice)
-    legacy = [{
-        "id": "1", "type": "status", "author": "Carol",
-        "date": server.today_iso(), "timestamp": server.now_iso(),
-        "summary": "Legacy entry.", "blockers": "None", "next_up": "",
-    }]
-    (wt / "entries.json").write_text(json.dumps(legacy))
-    run(["git", "add", "entries.json"], cwd=wt)
-    run(["git", "commit", "-m", "legacy"], cwd=wt)
-    run(["git", "push", "origin", "logging"], cwd=wt)
-
-    out = server.tool_read_status(str(pod.bob), when="today")
-    assert "Legacy entry." in out
-
-
 # ---------------------------------------------------------------------------
 # Archive
 # ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ def test_old_entries_are_archived_and_still_readable(pod):
     # Inject an old entry directly into Alice's file.
     old_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
     old_week = (datetime.now() - timedelta(days=200)).strftime("%G-W%V")
-    wt = server.ensure_logging_worktree(pod.alice)
+    wt, _ = server.ensure_logging_worktree(pod.alice)
     author_file = wt / "entries" / "alice.jsonl"
     entries = server.read_jsonl(author_file)
     entries.insert(0, {
@@ -223,7 +224,7 @@ def test_old_entries_are_archived_and_still_readable(pod):
     server.write_jsonl(author_file, entries)
 
     # Next write triggers archival.
-    server.tool_log_status("Trigger archive.", str(pod.alice), mode="update")
+    server.tool_log_status("Trigger archive.", str(pod.alice))
 
     files = run(["git", "ls-tree", "-r", "--name-only", "logging"], cwd=pod.origin).stdout
     assert f"archive/alice-{old_week}.jsonl" in files

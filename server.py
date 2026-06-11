@@ -292,21 +292,29 @@ def _ref_exists(ref: str, cwd) -> bool:
     return _git_run(["rev-parse", "--verify", "--quiet", ref], cwd=cwd).returncode == 0
 
 
-def _ensure_logging_branch_exists(repo: pathlib.Path):
-    """Create the local logging branch if missing.
+BRANCH_CREATED_NOTE = (
+    "Note: the 'logging' branch did not exist in this repo, so Pod-Sync "
+    "created it — an orphan branch holding only team updates and OpenSpec "
+    "documents, never code. Tell the user this happened."
+)
+
+
+def _ensure_logging_branch_exists(repo: pathlib.Path) -> bool:
+    """Create the local logging branch if missing. Returns True if created
+    brand-new (so callers can notify the user).
 
     Bases it on origin/logging when the remote branch exists (so teammates
     share one history), otherwise creates an orphan branch with an empty
     tree so no project code ever leaks onto the logging branch."""
     if _ref_exists("refs/heads/logging", repo):
-        return
+        return False
 
     _git_run(["fetch", "origin", "logging"], cwd=repo)
     if _ref_exists("refs/remotes/origin/logging", repo):
         result = _git_run(["branch", "--track", "logging", "origin/logging"], cwd=repo)
         if result.returncode != 0:
             raise RuntimeError(f"Could not create logging branch: {result.stderr.strip()}")
-        return
+        return False  # branch existed on origin — nothing new for the team
 
     tree = _git_run(["mktree"], cwd=repo, input_text="")
     if tree.returncode != 0:
@@ -320,35 +328,38 @@ def _ensure_logging_branch_exists(repo: pathlib.Path):
     result = _git_run(["branch", "logging", commit.stdout.strip()], cwd=repo)
     if result.returncode != 0:
         raise RuntimeError(f"Could not create logging branch: {result.stderr.strip()}")
+    return True
 
 
-def ensure_logging_worktree(repo_path) -> pathlib.Path:
-    """Return a directory where the logging branch is checked out.
+def ensure_logging_worktree(repo_path):
+    """Return (directory, branch_created) where the logging branch is checked out.
 
     Normally a hidden worktree under WORKTREES_DIR. If the user happens to
     have the logging branch checked out in their own working tree, that
-    checkout is used directly (a branch can only be checked out once)."""
+    checkout is used directly (a branch can only be checked out once).
+    branch_created is True when the logging branch was newly created for
+    this repo, so tools can notify the user."""
     repo = pathlib.Path(repo_path).resolve()
     if _git_run(["rev-parse", "--git-dir"], cwd=repo).returncode != 0:
         raise RuntimeError(f"Not a git repository: {repo}")
 
     if _git_run(["branch", "--show-current"], cwd=repo).stdout.strip() == "logging":
-        return repo
+        return repo, False
 
     wt = _worktree_path(repo)
     if (wt / ".git").exists() and _git_run(["rev-parse", "--git-dir"], cwd=wt).returncode == 0:
-        return wt
+        return wt, False
 
     # Stale or missing — rebuild it.
     if wt.exists():
         shutil.rmtree(wt, ignore_errors=True)
     _git_run(["worktree", "prune"], cwd=repo)
-    _ensure_logging_branch_exists(repo)
+    created = _ensure_logging_branch_exists(repo)
     wt.parent.mkdir(parents=True, exist_ok=True)
     result = _git_run(["worktree", "add", str(wt), "logging"], cwd=repo)
     if result.returncode != 0:
         raise RuntimeError(f"Could not create pod-sync worktree: {result.stderr.strip()}")
-    return wt
+    return wt, created
 
 
 def _sync_worktree(wt: pathlib.Path):
@@ -368,15 +379,8 @@ def _author_file(wt: pathlib.Path, slug: str) -> pathlib.Path:
 
 
 def _load_worktree_entries(wt: pathlib.Path, include_archive=False, weeks=None) -> list:
-    """Load all authors' entries, plus legacy single-file stores if present."""
+    """Load all authors' entries from the logging worktree."""
     entries = []
-
-    legacy = wt / "entries.json"
-    if legacy.exists():
-        try:
-            entries += json.loads(legacy.read_text())
-        except json.JSONDecodeError:
-            pass
 
     entries_dir = wt / "entries"
     if entries_dir.is_dir():
@@ -386,12 +390,6 @@ def _load_worktree_entries(wt: pathlib.Path, include_archive=False, weeks=None) 
     if include_archive and weeks:
         archive_dir = wt / "archive"
         for week in weeks:
-            legacy_archive = archive_dir / f"{week}.json"
-            if legacy_archive.exists():
-                try:
-                    entries += json.loads(legacy_archive.read_text())
-                except json.JSONDecodeError:
-                    pass
             for f in sorted(archive_dir.glob(f"*-{week}.jsonl")):
                 entries += read_jsonl(f)
 
@@ -566,8 +564,12 @@ def startup():
 # ---------------------------------------------------------------------------
 
 def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
-                    blockers: str = "None", next_up: str = "", mode: str = "new") -> str:
-    """Log an end-of-day status entry to the project repo's logging branch."""
+                    blockers: str = "None", next_up: str = "", mode: str = "log") -> str:
+    """Log a working-session status entry to the project repo's logging branch.
+
+    Each call appends one session entry — multiple sessions per day are
+    normal. mode="replace" swaps out today's most recent entry instead
+    (for fixing a mistake)."""
     if files_touched is None:
         files_touched = []
 
@@ -579,16 +581,9 @@ def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
     if author == "Unknown":
         return "Error: git config user.name is not set. Run: git config --global user.name \"Your Name\""
 
-    # Compatibility with the older prefix protocol.
-    if summary.startswith("[replace] "):
-        summary = summary[len("[replace] "):]
-        mode = "replace"
-    elif summary.startswith("[update] "):
-        summary = summary[len("[update] "):]
-        mode = "update"
-
-    if mode not in ("new", "update", "replace"):
-        return f"Error: invalid mode '{mode}'. Use 'new', 'update', or 'replace'."
+    if mode not in ("log", "replace"):
+        return (f"Error: invalid mode '{mode}'. Use 'log' (append this session's entry) "
+                f"or 'replace' (replace today's most recent entry).")
 
     repo_name = get_repo_name_from_path(project)
     date = today_iso()
@@ -596,7 +591,7 @@ def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
 
     with _repo_lock(project):
         try:
-            wt = ensure_logging_worktree(project)
+            wt, branch_created = ensure_logging_worktree(project)
         except RuntimeError as e:
             return f"Error preparing logging worktree: {e}"
 
@@ -606,16 +601,15 @@ def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
             author_file = _author_file(wt, slug)
             entries = read_jsonl(author_file)
 
-            if mode == "new":
-                existing_today = [e for e in entries if e.get("date") == date and e.get("type") == "status"]
-                if existing_today:
-                    return (
-                        f"You already have a status entry for today ({date}). "
-                        f"Would you like to:\n"
-                        f"  1. Append as a mid-day update (call again with mode=\"update\")\n"
-                        f"  2. Replace the existing entry (call again with mode=\"replace\")\n"
-                        f"Do not overwrite silently."
-                    )
+            if mode == "replace":
+                todays = [e for e in entries if e.get("date") == date and e.get("type") == "status"]
+                if not todays:
+                    return (f"Nothing to replace — you have no status entry for today ({date}). "
+                            f"Call again without mode=\"replace\" to log normally.")
+                # The author file is append-only, so the last of today's
+                # entries is the most recent regardless of timestamp ties.
+                latest = todays[-1]
+                entries = [e for e in entries if e is not latest]
 
             entry = {
                 "id": str(uuid4()),
@@ -632,8 +626,9 @@ def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
                 "archived": False,
             }
 
-            if mode == "replace":
-                entries = [e for e in entries if not (e.get("date") == date and e.get("type") == "status")]
+            session_number = sum(
+                1 for e in entries if e.get("date") == date and e.get("type") == "status"
+            ) + 1
 
             entries.append(entry)
             write_jsonl(author_file, entries)
@@ -653,7 +648,12 @@ def tool_log_status(summary: str, repo_path: str, files_touched: list = None,
     if not ok:
         return f"Entry saved locally but push failed: {err}"
 
-    msg = f"Logged and pushed to {repo_name}/logging (entries/{slug}.jsonl). ({author}, {date})"
+    msg = f"Logged and pushed to {repo_name}/logging (entries/{slug}.jsonl). ({author}, {date}"
+    if session_number > 1:
+        msg += f", session {session_number} today"
+    msg += ")"
+    if branch_created:
+        msg += f"\n{BRANCH_CREATED_NOTE}"
     if not sync_ok:
         msg += f"\nNote: could not sync with origin before writing ({sync_err})."
     return msg
@@ -716,7 +716,7 @@ def tool_read_status(repo_path: str, who: str = "all", when: str = "latest", que
 
     with _repo_lock(project):
         try:
-            wt = ensure_logging_worktree(project)
+            wt, branch_created = ensure_logging_worktree(project)
         except RuntimeError as e:
             return f"Error preparing logging worktree: {e}"
         try:
@@ -726,7 +726,10 @@ def tool_read_status(repo_path: str, who: str = "all", when: str = "latest", que
             return f"Error reading status: {e}"
 
     if not entries:
-        return "No entries found — this repo has no status log yet."
+        msg = "No entries found — this repo has no status log yet."
+        if branch_created:
+            msg += f"\n{BRANCH_CREATED_NOTE}"
+        return msg
 
     # Filter by author
     if who != "all":
@@ -735,7 +738,14 @@ def tool_read_status(repo_path: str, who: str = "all", when: str = "latest", que
     # Filter by date
     if when == "latest":
         by_author = {}
-        for e in sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True):
+        # File position breaks timestamp ties: author files are append-only,
+        # so a later index means a newer entry.
+        ordered = sorted(
+            enumerate(entries),
+            key=lambda p: (p[1].get("timestamp", ""), p[0]),
+            reverse=True,
+        )
+        for _, e in ordered:
             a = e.get("author", "Unknown")
             if a not in by_author:
                 by_author[a] = e
@@ -828,7 +838,7 @@ def tool_log_openspec_event(
 
     with _repo_lock(project):
         try:
-            wt = ensure_logging_worktree(project)
+            wt, branch_created = ensure_logging_worktree(project)
         except RuntimeError as e:
             return f"Error preparing logging worktree: {e}"
 
@@ -878,11 +888,14 @@ def tool_log_openspec_event(
     if not ok:
         return f"OpenSpec event saved locally but push failed: {err}"
 
-    return (
+    msg = (
         f"OpenSpec event logged. "
         f"Documents mirrored to {repo}/logging (working branch copy untouched). "
         f"Event visible in team dashboard."
     )
+    if branch_created:
+        msg += f"\n{BRANCH_CREATED_NOTE}"
+    return msg
 
 
 def tool_read_presence(repo_path: str) -> str:
@@ -944,7 +957,7 @@ def load_repo_entries(repo_path_str: str) -> list:
         return []
     with _repo_lock(project):
         try:
-            wt = ensure_logging_worktree(project)
+            wt, _ = ensure_logging_worktree(project)
             _sync_worktree(wt)
             return _load_worktree_entries(wt)
         except Exception as e:
@@ -1275,19 +1288,21 @@ def run_stdio():
         files_touched: list[str] = [],
         blockers: str = "None",
         next_up: str = "",
-        mode: str = "new",
+        mode: str = "log",
     ) -> str:
         """
-        Log your end-of-day status entry to the project repo's logging branch.
+        Log a working-session status entry to the project repo's logging branch.
+        Each call appends one session entry — logging multiple sessions per day
+        is normal and needs no special handling.
         Author is auto-detected from git config — never ask the user for their name.
         Never touches the user's working tree (writes happen in a hidden worktree).
         repo_path: absolute path to the project repo the user is working in.
         summary: 2-4 sentences, past tense, specific. Synthesize from conversation context.
-        files_touched: list of file paths modified today. Can be empty list.
+        files_touched: list of file paths modified this session. Can be empty list.
         blockers: anything blocking progress, or 'None'.
-        next_up: what you are picking up tomorrow. Specific enough a teammate could continue it.
-        mode: 'new' (default), 'update' (append a mid-day update for today),
-              or 'replace' (replace today's existing entry).
+        next_up: what gets picked up next session. Specific enough a teammate could continue it.
+        mode: 'log' (default — append this session's entry), or 'replace'
+              (replace today's most recent entry, for fixing a mistake).
         """
         return tool_log_status(summary, repo_path, files_touched, blockers, next_up, mode)
 

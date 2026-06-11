@@ -24,7 +24,7 @@ pod-sync install-skills
 
 This drops two skills into your IDE's global skills directory. Invoke them as slash commands from any project repo:
 
-- **/pod-sync-update** — log your end-of-day status. The agent collects context from git automatically, shows you a draft, and pushes after you confirm. If you created or updated OpenSpec changes today, it mirrors those documents to the logging branch in the same flow.
+- **/pod-sync-update** — log your working session. The agent collects context from git automatically, shows you a draft, and pushes after you confirm. Run it as often as you like — each session is its own entry. If you created or updated OpenSpec changes, it mirrors those documents to the logging branch in the same flow.
 - **/pod-sync-read** — read what the team did. Ask for a specific person, a date range, who's active right now, or just "catch me up".
 
 Or open the dashboard directly: **http://localhost:7823**

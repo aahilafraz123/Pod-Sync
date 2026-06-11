@@ -90,5 +90,7 @@ dashboard at `localhost:7823` if the user wants a visual view.
 | No entries match | "No entries found for [who] [when]." Do not fabricate. |
 | Only one author has logged | Show their data; note others have not logged. |
 | "What did I log?" | Valid read — `read_status(who=[their name], when="latest")`. |
+| Multiple entries per author per day | Normal — one entry per working session. `when="today"` shows all of them; `when="latest"` shows only the newest. |
+| Tool notes it created the `logging` branch | Relay that note to the user — no team log existed for this repo yet. |
 | Tool returns a sync warning | Present the data and relay the warning. |
 | Tool returns an error | Surface it. Do not retry without user input. |

@@ -10,8 +10,9 @@ the WRITE flow. For reading the team log or checking presence, use
 
 # Pod-Sync — Update Skill
 
-Turn today's work into a structured status entry on the project repo's
-`logging` branch, and mirror any OpenSpec change documents alongside it.
+Turn this working session's work into a structured status entry on the project
+repo's `logging` branch, and mirror any OpenSpec change documents alongside it.
+Each run logs one session entry — logging multiple sessions in a day is normal.
 All writes go through two MCP tools: `log_status()` and `log_openspec_event()`.
 The tools work in a hidden Pod-Sync worktree — the user's branch, checkout,
 and uncommitted changes are never touched, by you or by the tools.
@@ -51,10 +52,10 @@ git status --porcelain -- openspec/       # OpenSpec changes to mirror
 
 | Field | How to fill it |
 |-------|----------------|
-| summary | 2-4 sentences, past tense, specific. What was worked on and why it matters. |
+| summary | 2-4 sentences, past tense, specific. What was worked on this session and why it matters. |
 | files_touched | File paths from the diff. Can be empty. |
 | blockers | Stashed WIP, stuck work, anything the user mentions. "None" if clean. |
-| next_up | What picks up tomorrow — specific enough that a teammate could continue it. |
+| next_up | What picks up next session — specific enough that a teammate could continue it. |
 
 If a field cannot be determined, mark it "not detected" in the draft — do not
 fabricate. If `openspec/changes/` folders were created or modified, include
@@ -93,14 +94,17 @@ branch — they keep living on the user's working branch as normal. OpenSpec's
 own workflow creates the documents; Pod-Sync only mirrors them.
 
 **5. Report the result** — relay the tool's message. On success: "Status logged
-and pushed."
+and pushed." If the tool notes that it created the `logging` branch for this
+repo, tell the user — they should know the branch now exists.
 
 ## Edge cases
 
 | Situation | Action |
 |-----------|--------|
-| User already logged today | The tool says so. Ask: append (`mode="update"`) or replace (`mode="replace"`)? Call again with their choice. |
+| Second (or third…) session today | Just log it — each session is its own entry, no special handling. |
+| User wants to fix/redo their last entry | Call again with `mode="replace"` — it replaces today's most recent entry. |
 | "Just log it" with no detail | Ask for a one-sentence summary minimum. Do not log an empty entry. |
+| Tool notes it created the `logging` branch | Relay that note to the user. |
 | Auth/SSO push failure | Surface the tool's message; it links to re-authorization. Do not retry silently. |
 | "Entry saved locally but push failed" | Tell the user; the next successful log will push it. |
 | `git config user.name` not set | Tool returns an error — tell the user to set it. |
