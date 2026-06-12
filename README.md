@@ -33,10 +33,10 @@ A browser window opens — pick your IDE, verify git auth, done. This configures
 
 ```bash
 pod-sync install-skills        # global: VS Code, OpenCode
-pod-sync install-skills .      # per repo: required for Windsurf
+pod-sync install-skills .      # per repo: required for Devin (formerly Windsurf)
 ```
 
-Windsurf only loads skills per project, so run the second command once inside each repo you work in. (Skills follow the cross-IDE [Agent Skills](https://code.visualstudio.com/docs/agent-customization/agent-skills) convention — `<skill-name>/SKILL.md`.)
+Devin only loads skills per project (`.devin/skills/`), so run the second command once inside each repo you work in. (Skills follow the cross-IDE [Agent Skills](https://code.visualstudio.com/docs/agent-customization/agent-skills) convention — `<skill-name>/SKILL.md`.)
 
 **3. Use it:**
 

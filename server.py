@@ -493,18 +493,23 @@ def derive_presence(project: pathlib.Path) -> dict:
 # Skill installation
 #
 # Skills follow the Agent Skills convention: one folder per skill containing
-# a SKILL.md (skills/pod-sync-update/SKILL.md). Windsurf, VS Code (Copilot),
-# and OpenCode all read this structure — from different directories:
+# a SKILL.md (skills/pod-sync-update/SKILL.md). Devin (formerly Windsurf),
+# VS Code (Copilot), and OpenCode all read this structure — from different
+# directories:
 #
 #                workspace                    global
-#   windsurf     .windsurf/skills/            (none — workspace only)
+#   devin        .devin/skills/               (none — workspace only)
 #   vscode       .github/skills/              ~/.copilot/skills/
 #   opencode     .opencode/skills/            ~/.config/opencode/skills/
+#
+# Devin Desktop is the June 2026 rebrand of Windsurf; it reads .devin/ as
+# the primary workspace directory (with .windsurf/ as legacy fallback), so
+# we write the new canonical location.
 # ---------------------------------------------------------------------------
 
-WINDSURF_NO_GLOBAL_MSG = (
-    "Windsurf loads skills per project — run 'pod-sync install-skills .' "
-    "inside each project repo."
+DEVIN_NO_GLOBAL_MSG = (
+    "Devin (formerly Windsurf) loads skills per project — run "
+    "'pod-sync install-skills .' inside each project repo."
 )
 
 
@@ -536,14 +541,14 @@ def cmd_install_skills(target=None):
                    (not supported by Windsurf, which is workspace-only)
     target="."   → local install, skills scoped to the current working directory only
 
-    IDE detection order: windsurf → vscode → opencode
+    IDE detection order: devin (formerly windsurf) → vscode → opencode
     Uses shutil.which() — same cross-platform approach as api_detect_ides.
     """
 
-    # Detect IDE
+    # Detect IDE ('devin' is the rebranded Windsurf — accept both CLIs)
     ide = None
-    if shutil.which("windsurf"):
-        ide = "windsurf"
+    if shutil.which("devin") or shutil.which("windsurf"):
+        ide = "devin"
     elif shutil.which("code"):
         ide = "vscode"
     elif shutil.which("opencode"):
@@ -551,8 +556,8 @@ def cmd_install_skills(target=None):
 
     if target == ".":
         cwd = pathlib.Path.cwd()
-        if ide == "windsurf":
-            dest = cwd / ".windsurf" / "skills"
+        if ide == "devin":
+            dest = cwd / ".devin" / "skills"
         elif ide == "vscode":
             dest = cwd / ".github" / "skills"
         elif ide == "opencode":
@@ -562,15 +567,15 @@ def cmd_install_skills(target=None):
             dest = cwd / ".agents" / "skills"
         install_scope = f"local ({cwd.name})"
     else:
-        if ide == "windsurf":
-            print(f"  {WINDSURF_NO_GLOBAL_MSG}")
+        if ide == "devin":
+            print(f"  {DEVIN_NO_GLOBAL_MSG}")
             sys.exit(1)
         elif ide == "vscode":
             dest = pathlib.Path.home() / ".copilot" / "skills"
         elif ide == "opencode":
             dest = pathlib.Path.home() / ".config" / "opencode" / "skills"
         else:
-            print("No supported IDE detected (windsurf, code, opencode).")
+            print("No supported IDE detected (devin/windsurf, code, opencode).")
             print("Copy the folders in skills/ manually to your IDE's skills directory.")
             sys.exit(1)
         install_scope = "global"
@@ -1177,7 +1182,10 @@ def build_app(include_setup=True):
     @app.get("/api/detect-ides")
     async def api_detect_ides():
         detected = {}
-        for ide, cmd in [("windsurf", "windsurf"), ("vscode", "code"), ("opencode", "opencode")]:
+        # 'windsurf' is the wizard's internal id for Devin Desktop (the
+        # rebranded Windsurf) — either CLI counts as detected.
+        detected["windsurf"] = shutil.which("devin") is not None or shutil.which("windsurf") is not None
+        for ide, cmd in [("vscode", "code"), ("opencode", "opencode")]:
             detected[ide] = shutil.which(cmd) is not None
         return JSONResponse(detected)
 
@@ -1310,10 +1318,10 @@ def build_app(include_setup=True):
         note = ""
         try:
             if ide == "windsurf":
-                # Windsurf has no global skills directory — skills are
-                # per-workspace (.windsurf/skills/).
+                # Devin (formerly Windsurf) has no global skills directory —
+                # skills are per-workspace (.devin/skills/).
                 skills_dest = None
-                note = WINDSURF_NO_GLOBAL_MSG
+                note = DEVIN_NO_GLOBAL_MSG
             elif ide == "vscode":
                 skills_dest = pathlib.Path.home() / ".copilot" / "skills"
             elif ide == "opencode":

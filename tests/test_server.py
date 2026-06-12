@@ -346,25 +346,30 @@ def test_skill_sources_follow_agent_skills_convention():
         assert f"name: {d.name}" in text
 
 
-def test_install_skills_local_windsurf_layout(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        server.shutil, "which", lambda cmd: "/usr/bin/windsurf" if cmd == "windsurf" else None
-    )
-    server.cmd_install_skills(".")
-    assert (tmp_path / ".windsurf" / "skills" / "pod-sync-update" / "SKILL.md").exists()
-    assert (tmp_path / ".windsurf" / "skills" / "pod-sync-read" / "SKILL.md").exists()
+def test_install_skills_local_devin_layout(tmp_path, monkeypatch):
+    # The 'devin' CLI and the legacy 'windsurf' CLI both mean Devin Desktop,
+    # whose skills live at .devin/skills/.
+    for cli in ("devin", "windsurf"):
+        workdir = tmp_path / cli
+        workdir.mkdir()
+        monkeypatch.chdir(workdir)
+        monkeypatch.setattr(
+            server.shutil, "which", lambda cmd, _cli=cli: f"/usr/bin/{_cli}" if cmd == _cli else None
+        )
+        server.cmd_install_skills(".")
+        assert (workdir / ".devin" / "skills" / "pod-sync-update" / "SKILL.md").exists()
+        assert (workdir / ".devin" / "skills" / "pod-sync-read" / "SKILL.md").exists()
 
 
-def test_install_skills_global_windsurf_refuses(tmp_path, monkeypatch, capsys):
+def test_install_skills_global_devin_refuses(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
-        server.shutil, "which", lambda cmd: "/usr/bin/windsurf" if cmd == "windsurf" else None
+        server.shutil, "which", lambda cmd: "/usr/bin/devin" if cmd == "devin" else None
     )
     with pytest.raises(SystemExit):
         server.cmd_install_skills(None)
     assert "per project" in capsys.readouterr().out
-    assert not (tmp_path / ".windsurf").exists()
+    assert not (tmp_path / ".devin").exists()
 
 
 def test_install_skills_local_vscode_layout(tmp_path, monkeypatch):
