@@ -29,6 +29,7 @@ heartbeat file and no background commit traffic.
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -235,6 +236,28 @@ def _get_git_host(cwd=None):
     except Exception:
         pass
     return "github.com"
+
+
+def _https_origin_url(cwd=None):
+    """The origin remote as an HTTPS URL (for verifying PAT auth)."""
+    url = _git_run(["remote", "get-url", "origin"], cwd=cwd).stdout.strip()
+    if url.startswith("git@"):  # git@host:owner/repo(.git)
+        return "https://" + url[len("git@"):].replace(":", "/", 1)
+    if url.startswith("ssh://git@"):
+        return "https://" + url[len("ssh://git@"):]
+    if url.startswith("http"):
+        return url
+    return ""
+
+
+def _noninteractive_git_env():
+    """Environment that makes git fail fast instead of prompting.
+    Credential helpers (OS keychain) still work — only terminal/host-key
+    prompts are disabled."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    return env
 
 
 def get_repo_name_from_path(repo_path: pathlib.Path) -> str:
@@ -1161,13 +1184,17 @@ def build_app(include_setup=True):
     @app.post("/api/test-ssh")
     async def api_test_ssh():
         host = _get_git_host()
-        try:
-            result = subprocess.run(
-                ["ssh", "-T", f"git@{host}"],
-                capture_output=True, text=True, timeout=10
+        # In a thread so a slow ssh never freezes the whole server.
+        def _test():
+            return subprocess.run(
+                ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                 f"git@{host}"],
+                capture_output=True, text=True, timeout=15
             )
+        try:
+            result = await asyncio.to_thread(_test)
         except subprocess.TimeoutExpired:
-            return JSONResponse({"success": False, "message": "SSH test timed out after 10s."})
+            return JSONResponse({"success": False, "message": "SSH test timed out after 15s."})
         except FileNotFoundError:
             return JSONResponse({"success": False, "message": "ssh command not found on this machine."})
         output = result.stderr + result.stdout
@@ -1188,18 +1215,42 @@ def build_app(include_setup=True):
             f"username=git\n"
             f"password={pat}\n\n"
         )
-        result = subprocess.run(
-            ["git", "credential", "approve"],
-            input=credential_input, capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            return JSONResponse({"success": False, "message": result.stderr.strip()})
 
-        verify = subprocess.run(
-            ["git", "ls-remote", "--exit-code", "--quiet", "origin"],
-            capture_output=True, text=True, cwd=REPO_ROOT
-        )
-        success = verify.returncode == 0
+        # Both steps run in a thread with timeouts so a hung keychain dialog
+        # or network stall can never freeze the wizard.
+        def _store():
+            return subprocess.run(
+                ["git", "credential", "approve"],
+                input=credential_input, capture_output=True, text=True,
+                timeout=20, env=_noninteractive_git_env()
+            )
+        try:
+            result = await asyncio.to_thread(_store)
+        except subprocess.TimeoutExpired:
+            return JSONResponse({"success": False, "message": (
+                "Storing the token timed out. macOS may be showing a Keychain "
+                "permission dialog — look for it (possibly behind other windows), "
+                "click 'Always Allow', and try again."
+            )})
+        if result.returncode != 0:
+            return JSONResponse({"success": False, "message": result.stderr.strip() or "git credential approve failed."})
+
+        # Verify over HTTPS — that's the protocol a PAT authenticates.
+        https_url = _https_origin_url(cwd=REPO_ROOT)
+        if not https_url:
+            return JSONResponse({"success": True, "message": "PAT stored. (Could not verify — no origin remote found.)"})
+
+        def _verify():
+            return subprocess.run(
+                ["git", "ls-remote", "--exit-code", "--quiet", https_url],
+                capture_output=True, text=True, timeout=20,
+                env=_noninteractive_git_env(), cwd=REPO_ROOT
+            )
+        try:
+            verify = await asyncio.to_thread(_verify)
+            success = verify.returncode == 0
+        except subprocess.TimeoutExpired:
+            return JSONResponse({"success": True, "message": "PAT stored. (Verification timed out — likely fine, continue.)"})
         return JSONResponse({
             "success": success,
             "message": "PAT stored and verified." if success else "PAT stored but verification failed."

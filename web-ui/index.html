@@ -194,6 +194,10 @@
       <div class="auth-result" id="pat-result"></div>
       <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">Generate a token at <a href="https://github.com/settings/tokens" target="_blank">github.com/settings/tokens</a></p>
     </div>
+    <p id="auth-skip" style="display:none;margin-top:12px;font-size:13px;color:var(--text-muted)">
+      Verification only tests your credentials — it doesn't change them.
+      <a href="#" onclick="skipAuth(); return false;">Continue without verification &rarr;</a>
+    </p>
     <div class="step-nav">
       <button onclick="goToStep(1)">Back</button>
       <button class="primary" id="step2-next" onclick="goToStep(3)" disabled>Next</button>
@@ -364,6 +368,21 @@ function selectAuth(method) {
   document.getElementById('auth-' + method).classList.add('active');
 }
 
+function authPassed() {
+  authVerified = true;
+  document.getElementById('step2-next').disabled = false;
+  document.getElementById('auth-skip').style.display = 'none';
+}
+
+function authFailed() {
+  document.getElementById('auth-skip').style.display = 'block';
+}
+
+function skipAuth() {
+  authVerified = true;
+  document.getElementById('step2-next').disabled = false;
+}
+
 async function testSSH() {
   const el = document.getElementById('ssh-result');
   el.className = 'auth-result'; el.textContent = 'Testing...'; el.style.display = 'block';
@@ -372,9 +391,9 @@ async function testSSH() {
     const data = await res.json();
     if (data.success) {
       el.className = 'auth-result success'; el.textContent = 'SSH authentication verified.';
-      authVerified = true; document.getElementById('step2-next').disabled = false;
-    } else { el.className = 'auth-result error'; el.textContent = data.message || 'SSH test failed.'; }
-  } catch (e) { el.className = 'auth-result error'; el.textContent = 'Connection error.'; }
+      authPassed();
+    } else { el.className = 'auth-result error'; el.textContent = data.message || 'SSH test failed.'; authFailed(); }
+  } catch (e) { el.className = 'auth-result error'; el.textContent = 'Connection error.'; authFailed(); }
 }
 
 async function storePAT() {
@@ -386,10 +405,10 @@ async function storePAT() {
     const res = await fetch('/api/store-pat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pat }) });
     const data = await res.json();
     if (data.success) {
-      el.className = 'auth-result success'; el.textContent = 'PAT stored and verified.';
-      authVerified = true; document.getElementById('step2-next').disabled = false;
-    } else { el.className = 'auth-result error'; el.textContent = data.message || 'Failed.'; }
-  } catch (e) { el.className = 'auth-result error'; el.textContent = 'Connection error.'; }
+      el.className = 'auth-result success'; el.textContent = data.message || 'PAT stored and verified.';
+      authPassed();
+    } else { el.className = 'auth-result error'; el.textContent = data.message || 'Failed.'; authFailed(); }
+  } catch (e) { el.className = 'auth-result error'; el.textContent = 'Connection error.'; authFailed(); }
 }
 
 async function completeSetup() {
