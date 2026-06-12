@@ -1,6 +1,6 @@
 # Pod-Sync
 
-**Team coordination for AI-native dev pods.**
+**Team coordination for Enterprises that are moving towards pod-style development.**
 
 When everyone on a team builds with AI agents, individual speed goes up but shared context falls apart — nobody knows what anyone else (or anyone else's agent) did yesterday. Pod-Sync fixes that with two slash commands and a dashboard: log your working session when you finish, read your teammates' sessions when you start.
 
